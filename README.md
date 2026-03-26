@@ -45,9 +45,9 @@ curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/review-
 
 Each space is a `workspace.yml` with three building blocks:
 
-- **Signals** — how external events kick off your jobs (webhooks, cron, manual triggers)
-- **Agents** — built-in or custom agents that execute operations (Claude Code, GitHub, Bitbucket, Jira, and more)
-- **Jobs** — workflows composed of agents, tools, skills, and data contracts that run step by step
+- **[Signals](https://platform.hellofriday.ai/docs/core-concepts/signals)** — how external events kick off your jobs (webhooks, cron, manual triggers)
+- **[Agents](https://platform.hellofriday.ai/docs/core-concepts/agents)** — built-in or custom agents that execute operations (Claude Code, GitHub, Bitbucket, Jira, and more)
+- **[Jobs](https://platform.hellofriday.ai/docs/core-concepts/jobs)** — workflows composed of agents, tools, skills, and data contracts that run step by step
 
 ## Prerequisites
 
