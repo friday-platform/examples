@@ -17,9 +17,9 @@ Signal: fix-bug { issue_key, repo_url }
          |
     step_push_branch       Bitbucket agent pushes the feature branch
          |
-    step_create_pr         Bitbucket agent opens a PR with the fix
+    step_create_pr         Bitbucket agent opens a pull request with the fix
          |
-    step_update_ticket     Jira agent comments on the ticket with the PR link
+    step_update_ticket     Jira agent comments on the ticket with the pull request link
          |
       completed
 ```
@@ -70,8 +70,8 @@ curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/fix-bug
 2. **Bitbucket agent** clones the repo to an isolated workspace
 3. **Claude Code** creates a `fix/<issue-key>` branch, explores the codebase,
    implements the fix, adds tests if applicable, and commits
-4. **Bitbucket agent** pushes the branch and opens a PR
-5. **Jira agent** comments on the ticket with a link to the PR
+4. **Bitbucket agent** pushes the branch and opens a pull request
+5. **Jira agent** comments on the ticket with a link to the pull request
 
 A human reviews the pull request before merging — because ultimately, a person is
 responsible for what gets shipped.

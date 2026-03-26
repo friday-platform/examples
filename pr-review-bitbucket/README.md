@@ -9,11 +9,11 @@ posts structured inline comments back on the pull request.
 ```
 Signal: review-pr { pr_url }
          |
-    step_clone_repo        Clones repo, checks out PR branch, reads conventions
+    step_clone_repo        Bitbucket agent clones repo, checks out pull request branch, reads conventions
          |
-    step_review_pr         Reads full diff + changed files, reviews against 6 criteria
+    step_review_pr         Claude Code reads full diff + changed files, reviews against 6 criteria
          |
-    step_post_review       Formats findings as inline comments, posts to Bitbucket
+    step_post_review       Bitbucket agent formats findings as inline comments, posts review
          |
       completed
 ```

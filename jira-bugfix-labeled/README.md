@@ -20,9 +20,9 @@ Signal: process-labeled-bugs { project_key, repo_url }
          |
     step_push_branch       Bitbucket agent pushes the feature branch
          |
-    step_create_pr         Bitbucket agent opens a PR with the fix
+    step_create_pr         Bitbucket agent opens a pull request with the fix
          |
-    step_update_ticket     Jira agent comments on the ticket with the PR link
+    step_update_ticket     Jira agent comments on the ticket with the pull request link
          |
     step_transition_review Jira agent transitions the ticket to Done
          |
@@ -77,7 +77,7 @@ curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/process
 | **Input** | Specific `issue_key` + `repo_url` | `project_key` + `repo_url` — finds the ticket automatically |
 | **Ticket selection** | You choose the ticket | Picks highest-priority `ai-fix` ticket in "To Do" |
 | **Claiming** | No status change | Transitions ticket to "In Progress" before starting |
-| **Completion** | Comments with PR link | Comments with PR link AND transitions to "Done" |
+| **Completion** | Comments with pull request link | Comments with pull request link AND transitions to "Done" |
 
 This makes the labeled variant ideal for cron-triggered automation — point it at
 a project and let it continuously process the backlog.

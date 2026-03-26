@@ -9,7 +9,7 @@ structured inline comments back on the pull request.
 ```
 Signal: review-pr { pr_url }
          |
-    step_clone_repo        GitHub agent clones repo, checks out PR branch, reads conventions
+    step_clone_repo        GitHub agent clones repo, checks out pull request branch, reads conventions
          |
     step_review_pr         Claude Code reads full diff + changed files, reviews against 6 criteria
          |
@@ -45,7 +45,7 @@ Wait for the startup banner, then open the Studio at **http://localhost:5200**.
 
 ### 3. Publish the skill
 
-The PR review space uses the `@tempest/pr-code-review` skill. Publish it before
+The pull request review space uses the `@tempest/pr-code-review` skill. Publish it before
 loading the space.
 
 **Via the Studio:** Click **Skills** in the sidebar, then drag the `skill/`
@@ -79,7 +79,7 @@ Note the `id` in the response — you'll use it to trigger jobs.
 ### 5. Trigger a review
 
 **Via the Studio:** Navigate to the space, click **Run** on the PR Review job,
-and enter the PR URL.
+and enter the pull request URL.
 
 **Via the API:**
 
@@ -124,10 +124,10 @@ prepare_clone(context, event)
   |
   v
 GitHub agent (step_clone_repo)
-  - Clones repo, checks out PR branch
+  - Clones repo, checks out pull request branch
   - Reads README, CLAUDE.md, CONTRIBUTING.md, CODEOWNERS, linter configs
-  - Fetches PR metadata via gh pr view
-  - Outputs PR metadata + conventions to clone-output
+  - Fetches pull request metadata via gh pr view
+  - Outputs pull request metadata + conventions to clone-output
   |
   v
 prepare_review(context, event)
@@ -136,7 +136,7 @@ prepare_review(context, event)
   |
   v
 Claude Code (step_review_pr)
-  - Clones repo + checks out PR branch (agents are isolated)
+  - Clones repo + checks out pull request branch (agents are isolated)
   - Reads full diff via gh pr diff
   - Reads FULL content of every changed file for context
   - Analyzes against: correctness, security, performance,
