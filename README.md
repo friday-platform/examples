@@ -15,7 +15,7 @@ See [STUDIO_QUICKSTART.md](STUDIO_QUICKSTART.md) for the full walkthrough:
 Docker Compose setup, loading spaces, publishing skills, triggering jobs, and
 connecting webhooks.
 
-### TL;DR
+### In short
 
 ```bash
 # 1. Create .env with your API keys
