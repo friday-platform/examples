@@ -4,12 +4,10 @@ Starter spaces for [FAST](https://platform.hellofriday.ai/docs/) (Friday Agent S
 
 ## Examples
 
-| Example | Description | Integrations |
-| ------- | ----------- | ------------ |
-| [`pr-review`](pr-review/) | Reviews a GitHub pull request, posts inline comments with findings | GitHub |
-| [`pr-review-bitbucket`](pr-review-bitbucket/) | Reviews a Bitbucket Cloud pull request, posts inline comments with findings | Bitbucket |
-| [`jira-bugfix-bitbucket`](jira-bugfix-bitbucket/) | Reads a Jira bug ticket, implements a fix, opens a Bitbucket PR, and comments on the ticket | Jira + Bitbucket |
-| [`jira-bugfix-labeled`](jira-bugfix-labeled/) | Searches Jira for `ai-fix` labeled tickets, picks the highest-priority one, fixes it, opens a PR, and transitions the ticket to Done | Jira + Bitbucket |
+- **[pr-review](pr-review/)** — Reviews a GitHub pull request, posts inline comments with findings. (GitHub)
+- **[pr-review-bitbucket](pr-review-bitbucket/)** — Reviews a Bitbucket Cloud pull request, posts inline comments with findings. (Bitbucket)
+- **[jira-bugfix-bitbucket](jira-bugfix-bitbucket/)** — Reads a Jira bug ticket, implements a fix, opens a Bitbucket pull request, and comments on the ticket. (Jira + Bitbucket)
+- **[jira-bugfix-labeled](jira-bugfix-labeled/)** — Searches Jira for `ai-fix` labeled tickets, picks the highest-priority one, fixes it, opens a pull request, and transitions the ticket to Done. (Jira + Bitbucket)
 
 ## Quick start
 
