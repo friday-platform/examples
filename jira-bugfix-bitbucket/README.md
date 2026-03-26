@@ -1,8 +1,8 @@
 # Jira Bug Fix (Bitbucket)
 
-End-to-end bug fix pipeline. Reads a Jira bug ticket, clones the Bitbucket repo,
-implements the fix with Claude Code, opens a PR, and comments on the Jira ticket
-with the PR link.
+End-to-end bug fix pipeline built with [FAST](https://platform.hellofriday.ai/docs/) (Friday Agent Studio & Toolkit). Reads a Jira bug ticket, clones the Bitbucket repo,
+implements the fix with Claude Code, opens a pull request, and comments on the Jira ticket
+with the link.
 
 ## Pipeline
 
@@ -73,5 +73,13 @@ curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/fix-bug
 4. **Bitbucket agent** pushes the branch and opens a PR
 5. **Jira agent** comments on the ticket with a link to the PR
 
-A human reviews the PR before merging — because ultimately, a person is
+A human reviews the pull request before merging — because ultimately, a person is
 responsible for what gets shipped.
+
+## Learn more
+
+- [Quick start](https://platform.hellofriday.ai/docs/getting-started/quickstart) — get FAST running with Docker
+- [Agents](https://platform.hellofriday.ai/docs/core-concepts/agents) — built-in and custom agents
+- [Jobs](https://platform.hellofriday.ai/docs/core-concepts/jobs) — how workflows orchestrate agents step by step
+- [Signals](https://platform.hellofriday.ai/docs/core-concepts/signals) — how external events trigger jobs
+- [Studio](https://platform.hellofriday.ai/docs/tools/studio) — manage spaces, watch executions, test agents

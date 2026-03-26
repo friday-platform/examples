@@ -1,8 +1,8 @@
 # PR Code Review (Bitbucket)
 
-Automated pull request code review for Bitbucket Cloud. Accepts a Bitbucket PR
+Automated pull request code review for Bitbucket Cloud using [FAST](https://platform.hellofriday.ai/docs/) (Friday Agent Studio & Toolkit). Accepts a Bitbucket pull request
 URL, clones the repository, performs a thorough code review with Claude Code, and
-posts structured inline comments back on the PR.
+posts structured inline comments back on the pull request.
 
 ## Pipeline
 
@@ -67,3 +67,11 @@ curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/review-
 | Error handling | Swallowed errors, missing validation, leaked internals |
 | Testing | Missing coverage, untested edge cases, brittle mocks |
 | Style | Convention violations, dead code, naming inconsistencies |
+
+## Learn more
+
+- [Quick start](https://platform.hellofriday.ai/docs/getting-started/quickstart) — get FAST running with Docker
+- [Agents](https://platform.hellofriday.ai/docs/core-concepts/agents) — built-in and custom agents
+- [Jobs](https://platform.hellofriday.ai/docs/core-concepts/jobs) — how workflows orchestrate agents step by step
+- [Skills](https://platform.hellofriday.ai/docs/core-concepts/skills) — structured instruction sets for consistent agent output
+- [Studio](https://platform.hellofriday.ai/docs/tools/studio) — manage spaces, watch executions, test agents

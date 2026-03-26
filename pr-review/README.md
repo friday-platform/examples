@@ -1,8 +1,8 @@
 # PR Code Review
 
-Automated pull request code review using FAST. Accepts a GitHub PR URL, clones
+Automated pull request code review using [FAST](https://platform.hellofriday.ai/docs/) (Friday Agent Studio & Toolkit). Accepts a GitHub pull request URL, clones
 the repository, performs a thorough code review with Claude Code, and posts
-structured inline comments back on the PR.
+structured inline comments back on the pull request.
 
 ## Pipeline
 
@@ -211,7 +211,15 @@ curl -s -X POST http://localhost:8080/api/workspaces/create \
 
 ## Timing
 
-Expect ~8-10 minutes for a full review of a medium-sized PR (~40 files):
+Expect ~8-10 minutes for a full review of a medium-sized pull request (~40 files):
 - Step 1 (clone + conventions): ~2 min
 - Step 2 (review): ~2-3 min
 - Step 3 (format + post): ~2-3 min
+
+## Learn more
+
+- [Quick start](https://platform.hellofriday.ai/docs/getting-started/quickstart) — get FAST running with Docker
+- [Agents](https://platform.hellofriday.ai/docs/core-concepts/agents) — built-in and custom agents
+- [Jobs](https://platform.hellofriday.ai/docs/core-concepts/jobs) — how workflows orchestrate agents step by step
+- [Skills](https://platform.hellofriday.ai/docs/core-concepts/skills) — structured instruction sets for consistent agent output
+- [Studio](https://platform.hellofriday.ai/docs/tools/studio) — manage spaces, watch executions, test agents
