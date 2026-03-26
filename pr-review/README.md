@@ -9,16 +9,16 @@ structured inline comments back on the pull request.
 ```
 Signal: review-pr { pr_url }
          |
-    step_clone_repo        Clones repo, checks out PR branch, reads conventions
+    step_clone_repo        GitHub agent clones repo, checks out PR branch, reads conventions
          |
-    step_review_pr         Reads full diff + changed files, reviews against 6 criteria
+    step_review_pr         Claude Code reads full diff + changed files, reviews against 6 criteria
          |
-    step_post_review       Formats findings as inline comments, posts via gh pr review
+    step_post_review       GitHub agent formats findings as inline comments, posts review
          |
       completed
 ```
 
-Each step runs as an isolated agent. Steps 2 and 3 re-clone the repository
+Each step runs as an isolated agent. The review step re-clones the repository
 because agents don't share a filesystem.
 
 ## Quick start
@@ -120,10 +120,10 @@ HTTP signal { pr_url: "https://github.com/owner/repo/pull/123" }
 prepare_clone(context, event)
   - Parses event.data.pr_url -> owner, repo, pr_number, clone_url
   - Persists via context.setResult('pr-details', {...})
-  - Returns { task, config } for the Claude Code agent
+  - Returns { task, config } for the GitHub agent
   |
   v
-Claude Code (step_clone_repo)
+GitHub agent (step_clone_repo)
   - Clones repo, checks out PR branch
   - Reads README, CLAUDE.md, CONTRIBUTING.md, CODEOWNERS, linter configs
   - Fetches PR metadata via gh pr view
@@ -149,9 +149,8 @@ prepare_post_review(context, event)
   - Passes owner, repo, pr_number, clone_url, and review text to the agent
   |
   v
-Claude Code (step_post_review)
-  - Clones repo for gh CLI context
-  - Formats findings as markdown
+GitHub agent (step_post_review)
+  - Formats findings as inline review comments
   - Posts via: gh pr review <number> --repo owner/repo --comment --body-file review.md
   - Verifies the posted review
 ```
