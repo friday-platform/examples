@@ -53,8 +53,7 @@ For each finding, reference the exact file path and line number(s).
 | Activity | Load |
 |----------|------|
 | Reviewing code changes | [$SKILL_DIR/references/review-criteria.md] |
-| Reviewing Go (.go) files | [$SKILL_DIR/references/golang-review.md] |
-| Reviewing TypeScript (.ts, .tsx) files | [$SKILL_DIR/references/typescript-review.md] |
+| Reviewing Python (.py) files | [$SKILL_DIR/references/python-review.md] |
 | Formatting review output | [$SKILL_DIR/references/output-format.md] |
 | Posting review to GitHub | [$SKILL_DIR/references/gh-cli-patterns.md] |
 
