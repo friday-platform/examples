@@ -1,4 +1,4 @@
-# FAST — Studio Quickstart
+# Friday Agent Studio & Toolkit — Quickstart
 
 Get FAST (Friday Agent Studio & Toolkit) running locally with Docker Compose,
 load a space, and run your first agentic workflow.
