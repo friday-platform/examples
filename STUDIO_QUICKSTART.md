@@ -81,7 +81,7 @@ services:
     ports:
       - "8080:8080"  # Friday daemon API
       - "3100:3100"  # link (credential/auth service)
-      - "5200:5200"  # agent-studio (web UI)
+      - "5200:5200"  # Friday Studio (web UI)
       - "7681:7681"  # pty-server (WebSocket PTY)
       - "9090:9090"  # webhook-tunnel
     env_file:
