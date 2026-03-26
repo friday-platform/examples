@@ -121,14 +121,14 @@ jobs:
                 and base_branch.
 
                 IMPORTANT: Before starting the review, load the
-                @tempest/pr-code-review skill and follow its guidelines
+                pr-code-review skill and follow its guidelines
                 throughout the review. The skill contains detailed review
                 criteria, language-specific checks, and output formatting
                 rules that you must apply.
 
                 Follow these steps:
 
-                1. Load the @tempest/pr-code-review skill.
+                1. Load the pr-code-review skill.
 
                 2. Run `git diff <base_branch>...HEAD` in the clone_path to get
                    the full diff.
@@ -517,14 +517,14 @@ jobs:
                 changed_files.
 
                 IMPORTANT: Before starting the review, load the
-                @tempest/pr-code-review skill and follow its guidelines
+                pr-code-review skill and follow its guidelines
                 throughout the review. The skill contains detailed review
                 criteria, language-specific checks, and output formatting
                 rules that you must apply.
 
                 Follow these steps:
 
-                1. Load the @tempest/pr-code-review skill.
+                1. Load the pr-code-review skill.
 
                 2. Run `git diff <base_branch>...HEAD` in the clone_path to
                    see the current diff.
