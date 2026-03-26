@@ -5,14 +5,14 @@ load a space, and run your first agentic workflow.
 
 ## Overview
 
-FAST is a configuration-driven agentic orchestration runtime. You define
-**spaces** composed of three building blocks:
+[FAST](https://platform.hellofriday.ai/docs/) is a configuration-driven agentic orchestration runtime. You define
+[**spaces**](https://platform.hellofriday.ai/docs/core-concepts/spaces) composed of three building blocks:
 
-- **Signals** — how external events start your jobs (webhooks, cron, Slack,
+- [**Signals**](https://platform.hellofriday.ai/docs/core-concepts/signals) — how external events start your jobs (webhooks, cron, Slack,
   etc.)
-- **Agents** — built-in or custom agents that execute operations (Bitbucket,
+- [**Agents**](https://platform.hellofriday.ai/docs/core-concepts/agents) — built-in or custom agents that execute operations (Bitbucket,
   Jira, Claude Code, etc.)
-- **Jobs** — workflows composed of agents, tools, skills, and data contracts
+- [**Jobs**](https://platform.hellofriday.ai/docs/core-concepts/jobs) — workflows composed of agents, tools, skills, and data contracts
   that run step by step
 
 Everything is driven by a single `workspace.yml` configuration file. That makes
