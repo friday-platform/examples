@@ -2,7 +2,7 @@
 name: pr-code-review
 description: >-
   Performs thorough pull request code reviews covering correctness, security,
-  performance, error handling, testing, and style. Use when reviewing a GitHub
+  performance, error handling, testing, and style. Use when reviewing a Bitbucket
   pull request. Produces structured findings with file/line references and
   actionable suggestions.
 user-invocable: false
@@ -30,7 +30,7 @@ This context prevents false positives — flagging intentional behavior as bugs.
 
 Classify changed files by review priority:
 
-1. Run `gh pr diff <pr_number>` to get the full diff
+1. Run `git diff <base_branch>...HEAD` to get the full diff
 2. **Skip** files that don't need review:
    - Lock files (`package-lock.json`, `deno.lock`, `yarn.lock`, `pnpm-lock.yaml`)
    - Generated code (protobuf output, OpenAPI clients, `.gen.ts`)
@@ -52,10 +52,8 @@ For each finding, reference the exact file path and line number(s).
 
 | Activity | Load |
 |----------|------|
-| Reviewing code changes | [$SKILL_DIR/references/review-criteria.md] |
-| Reviewing Python (.py) files | [$SKILL_DIR/references/python-review.md] |
-| Formatting review output | [$SKILL_DIR/references/output-format.md] |
-| Posting review to GitHub | [$SKILL_DIR/references/gh-cli-patterns.md] |
+| Reviewing Python (.py) files | [python-review](references/python-review.md) |
+| Formatting review output | [output-format](references/output-format.md) |
 
 ## Key Principles
 
