@@ -20,7 +20,7 @@ a thorough, structured review that helps the author ship better code.
 Before reviewing any code, understand WHY the changes were made:
 
 1. Read the PR title, description, and linked issues to understand the goal
-2. Review the commit history (`git log --oneline base..HEAD`) to see how the
+2. Review the commit history (`git log --oneline <base_branch>..HEAD`) to see how the
    work evolved — later commits often fix issues from earlier ones
 3. Identify the type of change: feature, bug fix, refactor, config, dependency
 
@@ -32,8 +32,8 @@ Classify changed files by review priority:
 
 1. Run `git diff <base_branch>...HEAD` to get the full diff
 2. **Skip** files that don't need review:
-   - Lock files (`package-lock.json`, `deno.lock`, `yarn.lock`, `pnpm-lock.yaml`)
-   - Generated code (protobuf output, OpenAPI clients, `.gen.ts`)
+   - Lock files (`poetry.lock`, `Pipfile.lock`, `requirements.txt` if auto-generated)
+   - Generated code (protobuf output, OpenAPI clients, `_pb2.py`, `_pb2_grpc.py`)
    - Vendored dependencies
    - Binary assets (images, fonts, compiled output)
 3. Classify remaining files:
@@ -41,7 +41,7 @@ Classify changed files by review priority:
    - **Medium impact** — Supporting logic, internal utilities, configuration
    - **Low impact** — Tests, docs, formatting, renames
 4. Read the FULL content of every high/medium impact file (not just diff hunks)
-   to understand surrounding context, imports, and type definitions
+   to understand surrounding context, imports, and class/function signatures
 
 ### Stage 3: Deep Review
 
