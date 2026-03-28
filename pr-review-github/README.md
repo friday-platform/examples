@@ -54,10 +54,10 @@ folder onto the drop zone.
 **Via the API:**
 
 ```bash
-tar czf /tmp/pr-code-review.tar.gz -C pr-review/skill .
+tar czf /tmp/pr-code-review.tar.gz -C pr-review-github/skill .
 curl -X POST http://localhost:8080/api/skills/@tempest/pr-code-review/upload \
   -F "archive=@/tmp/pr-code-review.tar.gz" \
-  -F "skillMd=$(cat pr-review/skill/SKILL.md)"
+  -F "skillMd=$(cat pr-review-github/skill/SKILL.md)"
 ```
 
 ### 4. Load the space
@@ -68,7 +68,7 @@ onto the drop zone.
 **Via the API:**
 
 ```bash
-CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review/workspace.yml'))))")
+CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))")
 curl -s -X POST http://localhost:8080/api/workspaces/create \
   -H 'Content-Type: application/json' \
   -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review\"}"
@@ -221,7 +221,7 @@ FINDINGS:
 ```bash
 curl -s -X DELETE http://localhost:8080/api/workspaces/<workspace-id>
 
-CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review/workspace.yml'))))")
+CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))")
 curl -s -X POST http://localhost:8080/api/workspaces/create \
   -H 'Content-Type: application/json' \
   -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review\"}"
