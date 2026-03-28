@@ -71,7 +71,7 @@ onto the drop zone.
 CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))")
 curl -s -X POST http://localhost:8080/api/workspaces/create \
   -H 'Content-Type: application/json' \
-  -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review\"}"
+  -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review (GitHub)\"}"
 ```
 
 Note the `id` in the response — you'll use it to trigger jobs.
@@ -224,7 +224,7 @@ curl -s -X DELETE http://localhost:8080/api/workspaces/<workspace-id>
 CONFIG=$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))")
 curl -s -X POST http://localhost:8080/api/workspaces/create \
   -H 'Content-Type: application/json' \
-  -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review\"}"
+  -d "{\"config\":$CONFIG,\"workspaceName\":\"PR Review (GitHub)\"}"
 ```
 
 ## Timing

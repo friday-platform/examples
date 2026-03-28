@@ -33,7 +33,7 @@ open http://localhost:5200
 # 4. Load a space via the Studio or API
 curl -s -X POST http://localhost:8080/api/workspaces/create \
   -H 'Content-Type: application/json' \
-  -d "{\"config\":$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))"),\"workspaceName\":\"PR Review\"}"
+  -d "{\"config\":$(python3 -c "import yaml,json; print(json.dumps(yaml.safe_load(open('pr-review-github/workspace.yml'))))"),\"workspaceName\":\"PR Review (GitHub)\"}"
 
 # 5. Trigger a review
 curl -X POST http://localhost:8080/api/workspaces/<workspace-id>/signals/review-pr \
