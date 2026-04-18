@@ -1,0 +1,2973 @@
+version: '1.0'
+workspace:
+  name: Jira Bug Fix (Autonomous)
+  description: >-
+    Autonomous coding agent for Jira+Bitbucket. Finds tickets labeled
+    'ai-fix', implements fixes, opens PRs, and responds to CI failures and
+    review comments.
+
+signals:
+  fix-bug:
+    provider: http
+    title: Fix bug
+    description: >-
+      Find 'ai-fix' tickets in Jira, implement fixes, and open PRs.
+    config:
+      path: /webhooks/fix-bug
+    schema:
+      type: object
+      properties:
+        project_key:
+          type: string
+          title: Jira project key
+          description: >-
+            The Jira project key to search in (e.g., PROJ, DEV).
+        repo_url:
+          type: string
+          title: Bitbucket repository URL
+          description: >-
+            Full Bitbucket repository URL
+            (e.g., https://bitbucket.org/insanelygreatteam/google_workspace_mcp)
+      required:
+        - project_key
+        - repo_url
+
+  pr-event:
+    provider: http
+    title: PR event (CI status, comment, or merge)
+    description: >-
+      Handles CI failures, PR comments, and merge events. Comments starting
+      with @friday or /friday trigger automatic fixes.
+    config:
+      path: /hook/bitbucket/{workspaceId}/pr-event
+    params:
+      ci_status_keys: ["BITBUCKET-PIPELINES"]
+      jira_review_status: "Done"
+      ttl_hours_friday_prs: 168
+      reconcile_interval_minutes: 10
+    schema:
+      type: object
+      properties:
+        event_type:
+          type: string
+          enum: [ci_status, comment, merged]
+          description: Event type (ci_status, comment, or merged).
+        state:
+          type: string
+          enum: [SUCCESSFUL, FAILED]
+        key:
+          type: string
+        step_name:
+          type: string
+        commit_url:
+          type: string
+        build_url:
+          type: string
+        # comment fields
+        pr_id:
+          type: string
+        commit_sha:
+          type: string
+        comment_id:
+          type: string
+        comment_body:
+          type: string
+        comment_path:
+          type: string
+        comment_line:
+          type: number
+        author:
+          type: string
+        author_account_id:
+          type: string
+        # merged fields
+        merge_commit:
+          type: string
+      required:
+        - event_type
+
+  reconcile-prs:
+    provider: schedule
+    title: Reconcile Friday-owned PRs
+    description: >-
+      Cron job that polls for missed events. Fires every 10 minutes as a
+      fallback when webhooks fail.
+    config:
+      schedule: '*/10 * * * *'
+      timezone: UTC
+
+agents:
+  jira:
+    type: atlas
+    agent: jira
+    description: >-
+      Runs Jira Cloud API calls — read issues, search with JQL, create issues,
+      transition statuses.
+    prompt: Execute Jira Cloud operation.
+    env:
+      JIRA_SITE: from_environment
+      JIRA_EMAIL: from_environment
+      JIRA_API_TOKEN: from_environment
+
+  bb:
+    type: atlas
+    agent: bb
+    description: >-
+      Runs Bitbucket Cloud API calls — clone repos, push branches, create PRs.
+    prompt: Execute Bitbucket Cloud operation.
+    env:
+      BITBUCKET_EMAIL: from_environment
+      BITBUCKET_TOKEN: from_environment
+
+  claude-code:
+    type: atlas
+    agent: claude-code
+    description: >-
+      Implements bug fixes and lint-failure repairs in a cloned repository.
+      Reads the bug description, explores the codebase, runs local linters
+      and formatters before committing, and reports structured results.
+    prompt: >-
+      You are a senior software engineer. Implement bug fixes based on the
+      Jira ticket description. Write clean, well-tested code. Before
+      committing, run and fix any issues from local linters/formatters
+      (python: black . && isort . && pylint <modules>; js/react: npx eslint .
+      && npx prettier --check .). Only commit when all pass.
+    env:
+      ANTHROPIC_API_KEY: from_environment
+
+  # Deterministic router for PR events. Pure function — no LLM, HTTP, or state.
+  jira-bugfix-pr-router:
+    type: user
+    agent: jira-bugfix-pr-router
+    description: >-
+      Deterministic PR-event router. Given a webhook event plus state rows,
+      returns the next action (drop / fix_ci / fix_comment / record_merged /
+      escalate / noop). Pure function — no capabilities.
+
+jobs:
+  fix-bug:
+    title: Fix bug (autonomous)
+    description: >-
+      Ticket → PR pipeline: search → claim → clone → implement fix → push →
+      create PR → transition Jira → record PR. On push/agent failure,
+      escalates to Jira and records the failure.
+    triggers:
+      - signal: fix-bug
+    fsm:
+      id: fix-bug-pipeline
+      initial: idle
+      states:
+        idle:
+          entry:
+            - type: code
+              function: cleanup
+          'on':
+            fix-bug:
+              target: step_search_tickets
+
+        step_search_tickets:
+          entry:
+            - type: code
+              function: prepare_search
+            - type: agent
+              agentId: jira
+              outputTo: search-output
+              outputType: search-result
+              prompt: Execute Jira issue-search operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              - target: step_claim_ticket
+                guards:
+                  - guard_has_tickets
+              - target: completed
+                guards:
+                  - guard_no_tickets
+
+        step_claim_ticket:
+          entry:
+            - type: code
+              function: prepare_claim_ticket
+            - type: agent
+              agentId: jira
+              outputTo: claim-output
+              outputType: jira-ticket
+              prompt: Execute Jira issue-transition operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_clone_repo
+              guards:
+                - guard_claim_done
+
+        step_clone_repo:
+          entry:
+            - type: code
+              function: prepare_clone
+            - type: agent
+              agentId: bb
+              outputTo: clone-output
+              outputType: clone-result
+              prompt: Execute Bitbucket repo-clone operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_implement_fix
+              guards:
+                - guard_clone_done
+
+        step_implement_fix:
+          entry:
+            - type: code
+              function: prepare_implement
+            - type: agent
+              agentId: claude-code
+              outputTo: fix-output
+              outputType: fix-result
+              prompt: >-
+                You are implementing a bug fix. The repository has been
+                cloned and the main branch is checked out. Your input
+                contains the clone_path, bug details from the Jira ticket,
+                and the repo URL.
+
+                Follow these steps:
+
+                1. Read the bug description carefully to understand the
+                   issue.
+
+                2. Create a new branch named `fix/<issue_key>` (lowercase,
+                   e.g., `fix/proj-123`).
+
+                3. Explore the codebase to understand the relevant code.
+                   Read full files, not just grep results.
+
+                4. Implement the fix. Write clean, minimal code that
+                   addresses the bug without unnecessary refactoring.
+
+                5. Run local linters/formatters and address every failure
+                   (python: black . && isort . && pylint <modules>;
+                   js/react: npx eslint . && npx prettier --check .).
+                   Only run toolchains that apply to files you changed.
+
+                6. If the project has tests, add or update tests to cover
+                   the fix.
+
+                7. Commit the changes with a descriptive message
+                   referencing the Jira issue key.
+
+                8. Capture the head commit SHA (`git rev-parse HEAD`).
+
+                9. Do NOT push the branch — a separate agent handles that.
+
+                10. Use the `complete` tool to output:
+                   {
+                     "branch_name": "fix/proj-123",
+                     "commit_sha": "abc123...",
+                     "commit_message": "fix: description (PROJ-123)",
+                     "files_changed": ["path/to/file.ts"],
+                     "summary": "Brief description of the fix"
+                   }
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_push_branch
+              guards:
+                - guard_fix_done
+
+        step_push_branch:
+          entry:
+            - type: code
+              function: prepare_push
+            - type: agent
+              agentId: bb
+              outputTo: push-output
+              outputType: push-result
+              prompt: Execute Bitbucket repo-push operation.
+            - type: code
+              function: dispatch_push
+          'on':
+            PUSH_OK:
+              target: step_create_pr
+            PUSH_FAILED:
+              target: step_escalate
+
+        step_create_pr:
+          entry:
+            - type: code
+              function: prepare_create_pr
+            - type: agent
+              agentId: bb
+              outputTo: pr-output
+              outputType: pr-create-result
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_update_ticket
+              guards:
+                - guard_pr_done
+
+        step_update_ticket:
+          entry:
+            - type: code
+              function: prepare_transition_review
+            - type: agent
+              agentId: jira
+              outputTo: transition-output
+              outputType: jira-ticket
+              prompt: Execute Jira issue-transition operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_record_pr
+              guards:
+                - guard_transition_done
+
+        step_record_pr:
+          entry:
+            - type: code
+              function: record_pr
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        step_escalate:
+          entry:
+            - type: code
+              function: prepare_escalate
+            - type: agent
+              agentId: jira
+              outputTo: escalate-output
+              outputType: jira-ticket
+              prompt: Execute Jira issue-comment operation.
+            - type: code
+              function: record_escalated
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        completed:
+          type: final
+
+      functions:
+        cleanup:
+          type: action
+          code: |
+            export default function cleanup(context, event) {
+            }
+
+        prepare_search:
+          type: action
+          code: |
+            export default function prepare_search(context, event) {
+              const projectKey = event.data?.project_key;
+              const repoUrl = event.data?.repo_url;
+
+              if (!projectKey || typeof projectKey !== 'string') {
+                throw new Error('Missing required input: project_key');
+              }
+              if (!repoUrl || typeof repoUrl !== 'string') {
+                throw new Error('Missing required input: repo_url');
+              }
+
+              context.setResult('pipeline-input', {
+                project_key: projectKey,
+                repo_url: repoUrl,
+              });
+
+              context.createDoc({
+                id: 'jira-operation',
+                type: 'jira-operation',
+                data: {
+                  operation: 'issue-search',
+                  jql: 'project = "' + projectKey + '" AND labels = "ai-fix" AND status = "To Do" ORDER BY priority DESC',
+                  max_results: 1,
+                },
+              });
+
+              return {
+                task: 'Search for ai-fix bugs in ' + projectKey,
+                config: { operation: 'issue-search', project_key: projectKey },
+              };
+            }
+
+        guard_has_tickets:
+          type: guard
+          code: |
+            export default function guard_has_tickets(context, event) {
+              const result = context.results['search-output'];
+              if (!result) return false;
+              var data = result.data || result;
+              var issues = data.issues || [];
+              return issues.length > 0;
+            }
+
+        guard_no_tickets:
+          type: guard
+          code: |
+            export default function guard_no_tickets(context, event) {
+              const result = context.results['search-output'];
+              if (!result) return false;
+              var data = result.data || result;
+              var issues = data.issues || [];
+              return issues.length === 0;
+            }
+
+        prepare_claim_ticket:
+          type: action
+          code: |
+            export default function prepare_claim_ticket(context, event) {
+              const searchResult = context.results['search-output'];
+              var data = searchResult.data || searchResult;
+              var issues = data.issues || [];
+              var ticket = issues[0];
+
+              if (!ticket || !ticket.key) {
+                throw new Error('No ticket found in search results');
+              }
+
+              context.setResult('selected-ticket', ticket);
+
+              context.deleteDoc('jira-operation');
+              context.createDoc({
+                id: 'jira-operation',
+                type: 'jira-operation',
+                data: {
+                  operation: 'issue-transition',
+                  issue_key: ticket.key,
+                  transition_name: 'In Progress',
+                },
+              });
+
+              return {
+                task: 'Claim ticket ' + ticket.key + ' (Ready → In Progress)',
+                config: { operation: 'issue-transition', issue_key: ticket.key, transition_name: 'In Progress' },
+              };
+            }
+
+        guard_claim_done:
+          type: guard
+          code: |
+            export default function guard_claim_done(context, event) {
+              return context.results['claim-output'] !== undefined;
+            }
+
+        prepare_clone:
+          type: action
+          code: |
+            export default function prepare_clone(context, event) {
+              var input = context.results['pipeline-input'];
+              var repoUrl = input?.repo_url || '';
+              if (!repoUrl) {
+                throw new Error('Missing repo_url in pipeline-input');
+              }
+
+              context.deleteDoc('jira-operation');
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'repo-clone',
+                  repo_url: repoUrl,
+                },
+              });
+
+              return {
+                task: 'Clone repository from ' + repoUrl,
+                config: { operation: 'repo-clone', repo_url: repoUrl },
+              };
+            }
+
+        guard_clone_done:
+          type: guard
+          code: |
+            export default function guard_clone_done(context, event) {
+              return context.results['clone-output'] !== undefined;
+            }
+
+        prepare_implement:
+          type: action
+          code: |
+            export default function prepare_implement(context, event) {
+              var ticket = context.results['selected-ticket'];
+              var cloneOutput = context.results['clone-output'];
+
+              if (!ticket) throw new Error('Selected ticket not found');
+              if (!cloneOutput) throw new Error('Clone output not found');
+
+              var cloneData = cloneOutput.data || {};
+
+              return {
+                task: 'Fix bug ' + ticket.key + ': ' + (ticket.summary || ''),
+                config: {
+                  workDir: cloneData.path || '',
+                  repo: cloneData.repo || '',
+                  branch: cloneData.branch || '',
+                  issue_key: ticket.key,
+                  bug_title: ticket.summary || '',
+                  bug_description: ticket.description || '',
+                },
+              };
+            }
+
+        guard_fix_done:
+          type: guard
+          code: |
+            export default function guard_fix_done(context, event) {
+              return context.results['fix-output'] !== undefined;
+            }
+
+        prepare_push:
+          type: action
+          code: |
+            export default function prepare_push(context, event) {
+              var fix = context.results['fix-output'];
+              var cloneOutput = context.results['clone-output'];
+              var input = context.results['pipeline-input'];
+
+              if (!fix || !fix.branch_name) {
+                throw new Error('Fix output with branch_name not found');
+              }
+
+              var cloneData = cloneOutput?.data || {};
+
+              context.deleteDoc('bb-operation');
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'repo-push',
+                  path: cloneData.path,
+                  branch: fix.branch_name,
+                  repo_url: input.repo_url,
+                },
+              });
+
+              return {
+                task: 'Push branch ' + fix.branch_name,
+                config: { operation: 'repo-push', branch: fix.branch_name, repo_url: input.repo_url },
+              };
+            }
+
+        dispatch_push:
+          type: action
+          code: |
+            export default function dispatch_push(context, event) {
+              var pushOutput = context.results['push-output'] || {};
+              if (pushOutput.success === true) {
+                context.emit({ type: 'PUSH_OK' });
+              } else {
+                context.emit({ type: 'PUSH_FAILED' });
+              }
+            }
+
+        prepare_create_pr:
+          type: action
+          code: |
+            export default function prepare_create_pr(context, event) {
+              const fix = context.results['fix-output'];
+              const ticket = context.results['selected-ticket'];
+              const input = context.results['pipeline-input'];
+              const repoUrl = input?.repo_url || '';
+
+              if (!fix) throw new Error('Fix output not found');
+
+              var issueKey = ticket?.key || '';
+              var title = issueKey + ': ' + (fix.commit_message || fix.summary || 'Bug fix');
+
+              context.deleteDoc('bb-operation');
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-create',
+                  repo_url: repoUrl,
+                  source_branch: fix.branch_name,
+                  destination_branch: 'main',
+                  title: title,
+                  issue_key: issueKey,
+                  summary: (fix.summary || fix.commit_message || '') +
+                    '\n\nReply to this PR with `@friday` or `/friday` to request changes.',
+                  files_changed: fix.files_changed || [],
+                  close_source_branch: true,
+                },
+              });
+
+              return {
+                task: 'Create PR: ' + title,
+                config: { operation: 'pr-create', source_branch: fix.branch_name, issue_key: issueKey },
+              };
+            }
+
+        guard_pr_done:
+          type: guard
+          code: |
+            export default function guard_pr_done(context, event) {
+              return context.results['pr-output'] !== undefined;
+            }
+
+        prepare_transition_review:
+          type: action
+          code: |
+            export default function prepare_transition_review(context, event) {
+              const ticket = context.results['selected-ticket'];
+
+              var issueKey = ticket?.key || '';
+
+              var targetStatus = 'Done';
+
+              context.deleteDoc('bb-operation');
+              context.createDoc({
+                id: 'jira-operation',
+                type: 'jira-operation',
+                data: {
+                  operation: 'issue-transition',
+                  issue_key: issueKey,
+                  transition_name: targetStatus,
+                },
+              });
+
+              return {
+                task: 'Transition ticket ' + issueKey + ' → ' + targetStatus,
+                config: { operation: 'issue-transition', issue_key: issueKey, transition_name: targetStatus },
+              };
+            }
+
+        guard_transition_done:
+          type: guard
+          code: |
+            export default function guard_transition_done(context, event) {
+              return context.results['transition-output'] !== undefined;
+            }
+
+        record_pr:
+          type: action
+          code: |
+            export default function record_pr(context, event) {
+              var prOutput = context.results['pr-output'];
+              var fix = context.results['fix-output'];
+              var ticket = context.results['selected-ticket'];
+              var input = context.results['pipeline-input'];
+
+              if (!prOutput) throw new Error('PR output not found');
+
+              var prData = prOutput.data || {};
+              var issueKey = ticket?.key || '';
+              var repoUrl = input?.repo_url || '';
+
+              var repoSlug = '';
+              var match = repoUrl.match(/bitbucket\.org\/([^\/]+\/[^\/?#]+)/);
+              if (match) {
+                repoSlug = match[1].replace(/\.git$/, '');
+              }
+
+              context.stateAppend('friday-prs', {
+                pr_id: String(prData.pr_number),
+                ticket_key: issueKey,
+                sha: fix?.commit_sha || '',
+                branch: fix?.branch_name || '',
+                repo_slug: repoSlug,
+                repo_url: repoUrl,
+              }, 168);
+            }
+
+        prepare_escalate:
+          type: action
+          code: |
+            export default function prepare_escalate(context, event) {
+              var ticket = context.results['selected-ticket'];
+              var fix = context.results['fix-output'] || {};
+
+              var ticketKey = ticket?.key || '';
+              if (!ticketKey) {
+                throw new Error('Cannot escalate: no ticket_key available');
+              }
+
+              var lines = [];
+              lines.push('Friday could not fix bug ' + ticketKey +
+                ' — the agent did not produce a successful result.');
+              if (fix.summary) {
+                lines.push('');
+                lines.push('Summary: ' + fix.summary);
+              }
+              lines.push('');
+              lines.push('A human needs to take over.');
+
+              var body = lines.join('\n');
+
+              try { context.deleteDoc('jira-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'jira-operation',
+                type: 'jira-operation',
+                data: {
+                  operation: 'issue-comment',
+                  issue_key: ticketKey,
+                  body: body,
+                },
+              });
+
+              return {
+                task: 'Escalate on Jira ticket ' + ticketKey,
+                config: { operation: 'issue-comment', issue_key: ticketKey },
+              };
+            }
+
+        record_escalated:
+          type: action
+          code: |
+            export default function record_escalated(context, event) {
+              context.stateAppend('pr-events', {
+                pr_id: '',
+                type: 'escalated',
+                sha: '',
+                trigger: 'agent_failed',
+                ts: new Date().toISOString(),
+              }, 168);
+            }
+
+      documentTypes:
+        jira-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            issue_key: { type: string }
+            jql: { type: string }
+            project_key: { type: string }
+            summary: { type: string }
+            description: { type: string }
+            issue_type: { type: string }
+            body: { type: string }
+            transition_name: { type: string }
+          required:
+            - operation
+
+        search-result:
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+              properties:
+                issues:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      key: { type: string }
+                      summary: { type: string }
+                      description: { type: string }
+                      status: { type: string }
+                      priority: { type: string }
+                      labels:
+                        type: array
+                        items: { type: string }
+                total: { type: number }
+          required:
+            - operation
+            - success
+
+        jira-ticket:
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+              properties:
+                key: { type: string }
+                summary: { type: string }
+                description: { type: string }
+                status: { type: string }
+                priority: { type: string }
+                labels:
+                  type: array
+                  items: { type: string }
+                assignee: { type: string }
+                reporter: { type: string }
+                from_status: { type: string }
+                to_status: { type: string }
+          required:
+            - operation
+            - success
+
+        bb-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            repo_url: { type: string }
+            source_branch: { type: string }
+            destination_branch: { type: string }
+            title: { type: string }
+            description: { type: string }
+            close_source_branch: { type: boolean }
+            path: { type: string }
+            branch: { type: string }
+            issue_key: { type: string }
+            summary: { type: string }
+            files_changed:
+              type: array
+              items: { type: string }
+          required:
+            - operation
+
+        clone-result: &clone-result
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+              properties:
+                path: { type: string }
+                repo: { type: string }
+                branch: { type: string }
+          required: [operation, success]
+
+        push-result: &push-result
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+              properties:
+                repo: { type: string }
+                branch: { type: string }
+          required: [operation, success]
+
+        pr-create-result:
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+              properties:
+                pr_number: { type: number }
+                pr_url: { type: string }
+                repo: { type: string }
+                source_branch: { type: string }
+                destination_branch: { type: string }
+                title: { type: string }
+          required: [operation, success, data]
+
+        fix-result: &fix-result
+          type: object
+          properties:
+            branch_name: { type: string }
+            commit_message: { type: string }
+            commit_sha: { type: string }
+            files_changed:
+              type: array
+              items: { type: string }
+            summary: { type: string }
+          required: [branch_name, summary]
+
+      tools: {}
+
+  handle-pr-event:
+    title: Handle PR event (CI status, comment, or merge)
+    description: >-
+      Handles CI failures, PR comments, and merge events from Bitbucket.
+    triggers:
+      - signal: pr-event
+    fsm:
+      id: handle-pr-event-pipeline
+      initial: idle
+      states:
+        idle:
+          'on':
+            pr-event:
+              target: step_normalize_event
+
+        step_normalize_event:
+          entry:
+            - type: code
+              function: normalize_event
+          'on':
+            SEARCH:
+              target: step_pr_search_preprocess
+            CONTINUE:
+              target: step_router_input
+
+        step_pr_search_preprocess:
+          entry:
+            - type: code
+              function: prepare_router_pr_search
+            - type: agent
+              agentId: bb
+              outputTo: router-pr-search-output
+              outputType: bb-result
+              prompt: Execute Bitbucket bb-pr-search-by-sha operation.
+            - type: code
+              function: resolve_router_after_search
+          'on':
+            DROP:
+              target: step_record_router_drop
+            CONTINUE:
+              target: step_router_input
+
+        # Build the router's input payload (event + raw friday-prs rows +
+        # raw pr-events rows + behavior knobs from signals.pr-event.params),
+        # then call the router. The router filters rows by pr_id internally.
+        step_router_input:
+          entry:
+            - type: code
+              function: build_router_input
+            - type: agent
+              agentId: jira-bugfix-pr-router
+              outputTo: router-output
+              outputType: router-decision
+              prompt: Execute jira-bugfix-pr-router webhook operation.
+            - type: code
+              function: dispatch_router_decision
+          'on':
+            ROUTER_DROP:
+              target: step_record_router_drop
+            ROUTER_FIX_CI:
+              target: step_ci_list_pipelines
+            ROUTER_FIX_COMMENT:
+              target: step_comment_gather_threads
+            ROUTER_RECORD_MERGED:
+              target: step_router_record_merged
+            ROUTER_ESCALATE:
+              target: step_shared_escalate_jira
+            ROUTER_NOOP:
+              target: completed
+
+        step_record_router_drop:
+          entry:
+            - type: code
+              function: record_router_drop
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        # ---------------------------------------------------------------
+        # CI prelude: list pipelines → get steps → fetch step logs with the
+        # inner counter loop. Gathers source-specific context; terminates by
+        # entering the shared `remediate` tail.
+        # ---------------------------------------------------------------
+
+        step_ci_list_pipelines:
+          entry:
+            - type: code
+              function: prepare_list_pipelines
+            - type: agent
+              agentId: bb
+              outputTo: pipelines-output
+              outputType: bb-result
+              prompt: Execute Bitbucket bb-list-pipelines-for-commit operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_ci_get_steps
+              guards:
+                - guard_pipelines_done
+
+        step_ci_get_steps:
+          entry:
+            - type: code
+              function: prepare_get_steps
+            - type: agent
+              agentId: bb
+              outputTo: steps-output
+              outputType: bb-result
+              prompt: Execute Bitbucket bb-get-pipeline-steps operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_ci_fetch_step_log
+              guards:
+                - guard_steps_done
+
+        step_ci_fetch_step_log:
+          entry:
+            - type: code
+              function: prepare_fetch_step_log
+          'on':
+            LOG_NEXT:
+              target: step_ci_fetch_step_log_call
+            LOG_DONE:
+              target: step_ci_clone
+
+        step_ci_fetch_step_log_call:
+          entry:
+            - type: agent
+              agentId: bb
+              outputTo: step-log-output
+              outputType: bb-result
+              prompt: Execute Bitbucket bb-get-step-log operation.
+            - type: code
+              function: collect_step_log
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_ci_fetch_step_log
+
+        step_ci_clone:
+          entry:
+            - type: code
+              function: prepare_clone_for_ci_router
+            - type: agent
+              agentId: bb
+              outputTo: ci-clone-output
+              outputType: clone-result
+              prompt: Execute Bitbucket repo-clone operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_fix
+              guards:
+                - guard_ci_clone_done
+
+        # ---------------------------------------------------------------
+        # Comment prelude: read threads → clone. Same tail pattern.
+        # ---------------------------------------------------------------
+
+        step_comment_gather_threads:
+          entry:
+            - type: code
+              function: prepare_gather_context_router
+            - type: agent
+              agentId: bb
+              outputTo: threads-output
+              outputType: bb-result
+              prompt: Execute Bitbucket pr-read-threads operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_comment_clone
+              guards:
+                - guard_threads_done
+
+        step_comment_clone:
+          entry:
+            - type: code
+              function: prepare_clone_for_comment_router
+            - type: agent
+              agentId: bb
+              outputTo: comment-clone-output
+              outputType: clone-result
+              prompt: Execute Bitbucket repo-clone operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_fix
+              guards:
+                - guard_comment_clone_done
+
+        step_fix:
+          entry:
+            - type: code
+              function: gather_remediate_context
+            - type: llm
+              provider: anthropic
+              model: claude-haiku-4-5-20251001
+              prompt: >-
+                You are synthesizing a task prompt for a coding agent (claude-code)
+                that will fix code in a cloned repository.
+
+                Your input contains source-specific context:
+                - source: either "ci" or "comment"
+                - For "ci": failed_steps (array of {name, tail, matched_lines}),
+                  commit_sha, workDir, branch
+                - For "comment": originating_comment ({comment_id, body}),
+                  unresolved_threads (array of thread objects), workDir, branch
+
+                Rules for CI source:
+                - Focus on diagnosing the CI failure from the provided failed
+                  step logs.
+                - Tell the agent to cd into workDir, git reset --hard <commit_sha>,
+                  identify the root-cause failure, make a surgical fix, run
+                  local linters, and commit on the existing branch.
+                - Do NOT tell the agent to push.
+
+                Rules for comment source:
+                - Focus on addressing the reviewer's comment with minimal changes.
+                - Tell the agent to cd into workDir, git reset --hard <commit_sha>
+                  if commit_sha is provided, make a minimal surgical change that
+                  satisfies the originating comment, run local linters, and commit.
+                - Do NOT tell the agent to push.
+
+                Output a JSON object with these fields:
+                - task_prompt (string): the synthesized prompt for claude-code
+                - workDir (string): pass through from input
+                - branch (string): pass through from input
+                - source (string): pass through from input
+                - pr_id (string): pass through from input
+                - commit_sha (string): pass through from input (if present)
+                - failed_steps (array): pass through from input (CI only)
+                - originating_comment (object): pass through from input (comment only)
+                - unresolved_threads (array): pass through from input (comment only)
+              outputTo: remediate-fix-input
+              outputType: remediate-fix-input
+            - type: code
+              function: stage_remediate_fix
+            - type: agent
+              agentId: claude-code
+              outputTo: fix-output
+              outputType: fix-result
+              prompt: >-
+                You are implementing a fix inside an already-cloned repository.
+                Your Input (below) contains a source-specific task prompt,
+                along with the clone path and branch context.
+
+                Follow the `task_prompt` verbatim — it embeds source-specific
+                instructions for the initial / CI / comment branches.
+
+                When you terminate, use the `complete` tool to emit a
+                structured fix-result with `branch_name` and `summary`.
+                Do NOT push the branch — a separate FSM step handles that.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_remediate_push
+              guards:
+                - guard_fix_output_done
+
+        step_remediate_push:
+          entry:
+            - type: code
+              function: prepare_remediate_push
+            - type: agent
+              agentId: bb
+              outputTo: remediate-push-output
+              outputType: push-result
+              prompt: Execute Bitbucket repo-push operation.
+            - type: code
+              function: dispatch_source
+          'on':
+            SOURCE_CI:
+              target: step_remediate_record_ci
+            SOURCE_COMMENT:
+              target: step_remediate_record_comment
+            PUSH_FAILED:
+              target: step_shared_escalate_jira
+
+        step_remediate_record_ci:
+          entry:
+            - type: code
+              function: record_remediate_ci
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        step_remediate_record_comment:
+          entry:
+            - type: code
+              function: record_remediate_comment
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_remediate_respond_on_pr
+
+        step_remediate_respond_on_pr:
+          entry:
+            - type: code
+              function: gather_pr_reply_context
+            - type: llm
+              provider: anthropic
+              model: claude-haiku-4-5-20251001
+              prompt: >-
+                You are writing a brief PR reply acknowledging a reviewer's
+                comment and explaining what was changed by an autonomous
+                coding agent (Friday).
+
+                Your input contains:
+                - originating_comment: the reviewer's comment that triggered
+                  the fix ({comment_id, body})
+                - fix_summary: what the agent changed
+                - commit_sha: the commit SHA of the fix (may be empty)
+
+                Rules:
+                - Write a brief PR reply acknowledging the reviewer's comment
+                  and explaining what was changed.
+                - Reference the commit SHA (first 12 chars) if available.
+                - Keep it under 3 sentences — reviewers do not want novels.
+                - Be professional but not robotic. No greetings, no sign-offs.
+
+                Output a JSON object with a single "body" field containing
+                the reply text.
+              outputTo: pr-reply-message
+              outputType: pr-reply-text
+            - type: code
+              function: stage_pr_reply
+            - type: agent
+              agentId: bb
+              outputTo: remediate-respond-output
+              outputType: bb-result
+              prompt: Execute Bitbucket pr-post-followup operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+              guards:
+                - guard_remediate_respond_done
+
+        # Router-decision branch: record_merged. Comes directly from router
+        # when a `merged` event arrives for a Friday-owned PR.
+        step_router_record_merged:
+          entry:
+            - type: code
+              function: record_merged_router
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        # Shared escalate: entered by router's `escalate` decision OR by the
+        # remediate tail on failed/crashed outcomes. Posts on Jira, posts on
+        # the PR (when available), appends an `escalated` pr-events row.
+        # prepare_shared_escalate_pr emits SKIP_PR when no PR URL is
+        # available so the bb agent step is skipped entirely — the `bb`
+        # agent has no noop op and staging one crashes the session.
+        step_shared_escalate_jira:
+          entry:
+            - type: code
+              function: gather_escalate_context
+            - type: llm
+              provider: anthropic
+              model: claude-haiku-4-5-20251001
+              prompt: >-
+                You are writing a concise Jira comment explaining why Friday
+                (an autonomous coding agent) is escalating a pull request.
+
+                Your input contains:
+                - decision: the router's escalation decision with action,
+                  reason (including counters like total_pushes, ci_since_comment,
+                  cap, trigger), pr_id
+                - fix_output: the agent's fix output (if any), with summary
+                - pr_events: recent pr-events breadcrumbs for this PR (up to
+                  10, oldest first) showing the history of what happened
+                - pr_url: link to the PR (may be empty)
+
+                Rules:
+                - If the decision action is "escalate" (budget escalation),
+                  include the relevant counters (total pushes, CI attempts
+                  since last comment) and which cap was hit.
+                - If the agent failed (not a budget escalation), note the
+                  failure summary from fix_output.
+                - Include a link to the PR if pr_url is non-empty.
+                - Include recent pr-events breadcrumbs as a bulleted timeline
+                  with timestamps, event type, trigger, and short SHA.
+                - End with "A human needs to take over."
+                - Keep it factual and brief — this is a status update, not
+                  creative writing. No greetings, no sign-offs.
+
+                Output a JSON object with a single "body" field containing
+                the full comment text.
+              outputTo: escalate-message
+              outputType: escalation-text
+            - type: code
+              function: stage_escalate_jira
+            - type: agent
+              agentId: jira
+              outputTo: shared-escalate-jira-output
+              outputType: jira-ticket
+              prompt: Execute Jira issue-comment operation.
+            - type: code
+              function: prepare_shared_escalate_pr
+          'on':
+            HAS_PR:
+              target: step_shared_escalate_pr
+            SKIP_PR:
+              target: step_shared_escalate_record
+
+        step_shared_escalate_pr:
+          entry:
+            - type: agent
+              agentId: bb
+              outputTo: shared-escalate-pr-output
+              outputType: bb-result
+              prompt: Execute Bitbucket pr-post-followup operation.
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_shared_escalate_record
+
+        step_shared_escalate_record:
+          entry:
+            - type: code
+              function: record_shared_escalated
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: completed
+
+        completed:
+          type: final
+
+      functions:
+        # ---------------------------------------------------------------
+        normalize_event:
+          type: action
+          code: |
+            export default function normalize_event(context, event) {
+              var data = event.data || {};
+              var eventType = data.event_type || '';
+              var prIdRaw = data.pr_id;
+              var prId = (prIdRaw === undefined || prIdRaw === null || prIdRaw === '')
+                ? ''
+                : String(prIdRaw);
+              var commitUrl = data.commit_url || '';
+              var commitSha = data.commit_sha ? String(data.commit_sha) : '';
+
+              var shaFromUrl = '';
+              var shaMatch = String(commitUrl).match(/\/commit\/([a-f0-9]+)$/);
+              if (shaMatch) shaFromUrl = shaMatch[1];
+
+              var repoSlug = '';
+              var repoMatch = String(commitUrl).match(/repositories\/([^\/]+\/[^\/]+)\/commit\//);
+              if (repoMatch) repoSlug = repoMatch[1];
+
+              var resolvedSha = eventType === 'ci_status'
+                ? (shaFromUrl || commitSha)
+                : commitSha;
+
+              var normalized = {
+                event_type: eventType,
+                pr_id: prId,
+                sha: resolvedSha,
+                state: data.state || '',
+                key: data.key || '',
+                type: data.type || '',
+                commit_url: commitUrl,
+                repo_slug: repoSlug,
+                comment_id: data.comment_id === undefined ? '' : data.comment_id,
+                comment_body: data.comment_body || '',
+                comment_path: data.comment_path || '',
+                author: data.author || '',
+                author_account_id: data.author_account_id || '',
+                merge_commit: data.merge_commit || '',
+              };
+              context.setResult('router-event', normalized);
+
+              if (eventType === 'ci_status' && !prId) {
+                context.emit({ type: 'SEARCH' });
+                return;
+              }
+              context.emit({ type: 'CONTINUE' });
+            }
+
+        prepare_router_pr_search:
+          type: action
+          code: |
+            export default function prepare_router_pr_search(context, event) {
+              var evt = context.results['router-event'] || {};
+              var repoSlug = evt.repo_slug || '';
+              var sha = evt.sha || '';
+
+              if (!repoSlug) {
+                context.setResult('router-decision', {
+                  action: 'drop',
+                  reason: 'not_friday_owned',
+                });
+                context.emit({ type: 'DROP' });
+                return;
+              }
+
+              var stateCache = context.results.__stateCache || {};
+              var fridayPrRows = stateCache['friday-prs'] || [];
+              var hintBranch = '';
+              for (var i = 0; i < fridayPrRows.length; i++) {
+                try {
+                  var entry = JSON.parse(fridayPrRows[i].data);
+                  if (entry && entry.repo_slug === repoSlug && entry.branch) {
+                    hintBranch = entry.branch;
+                    break;
+                  }
+                } catch (e) { /* skip */ }
+              }
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'bb-pr-search-by-sha',
+                  repo_slug: repoSlug,
+                  commit_sha: sha,
+                  branch: hintBranch,
+                },
+              });
+              return {
+                task: 'Search Bitbucket for PRs matching sha ' + sha,
+                config: {
+                  operation: 'bb-pr-search-by-sha',
+                  repo_slug: repoSlug,
+                  commit_sha: sha,
+                  branch: hintBranch,
+                },
+              };
+            }
+
+        resolve_router_after_search:
+          type: action
+          code: |
+            export default function resolve_router_after_search(context, event) {
+              var evt = context.results['router-event'] || {};
+              var sha = evt.sha || '';
+              var searchOutput = context.results['router-pr-search-output'] || {};
+              var searchData = searchOutput.data || {};
+              var prIds = searchData.pr_ids || [];
+
+              var stateCache = context.results.__stateCache || {};
+              var fridayPrRows = stateCache['friday-prs'] || [];
+
+              var prIdSet = {};
+              for (var i = 0; i < prIds.length; i++) {
+                prIdSet[String(prIds[i])] = true;
+              }
+
+              var matched = null;
+              var matchedTs = '';
+              for (var j = 0; j < fridayPrRows.length; j++) {
+                try {
+                  var entry = JSON.parse(fridayPrRows[j].data);
+                  if (!entry || !prIdSet[String(entry.pr_id)]) continue;
+                  var ts = fridayPrRows[j]._ts || '';
+                  if (!matched || ts > matchedTs) {
+                    matched = entry;
+                    matchedTs = ts;
+                  }
+                } catch (e) { /* skip */ }
+              }
+
+              if (!matched) {
+                context.setResult('router-decision', {
+                  action: 'drop',
+                  reason: 'pr_not_found',
+                });
+                context.emit({ type: 'DROP' });
+                return;
+              }
+
+              context.stateAppend('friday-prs', {
+                pr_id: String(matched.pr_id),
+                ticket_key: matched.ticket_key || '',
+                sha: sha,
+                branch: matched.branch || '',
+                repo_slug: matched.repo_slug || searchData.repo || '',
+                repo_url: matched.repo_url || '',
+              }, 168);
+
+              evt.pr_id = String(matched.pr_id);
+              if (!evt.repo_slug) evt.repo_slug = matched.repo_slug || searchData.repo || '';
+              context.setResult('router-event', evt);
+              context.emit({ type: 'CONTINUE' });
+            }
+
+        build_router_input:
+          type: action
+          code: |
+            export default function build_router_input(context, event) {
+              var evt = context.results['router-event'] || {};
+
+              var stateCache = context.results.__stateCache || {};
+              var fridayPrRows = stateCache['friday-prs'] || [];
+              var prEventRows = stateCache['pr-events'] || [];
+
+              function parseRows(rows) {
+                var out = [];
+                for (var i = 0; i < rows.length; i++) {
+                  try {
+                    var entry = JSON.parse(rows[i].data);
+                    if (!entry || typeof entry !== 'object') continue;
+                    entry._ts = rows[i]._ts;
+                    out.push(entry);
+                  } catch (e) { /* skip */ }
+                }
+                return out;
+              }
+
+              var fridayPrs = parseRows(fridayPrRows);
+              var prEvents = parseRows(prEventRows);
+
+              var routerEvent = {
+                event_type: evt.event_type || '',
+              };
+              if (evt.event_type === 'ci_status') {
+                routerEvent.state = evt.state || '';
+                routerEvent.key = evt.key || '';
+                routerEvent.type = evt.type || '';
+                var commitUrl = evt.commit_url || '';
+                if (!commitUrl && evt.sha) {
+                  var repoForPr = evt.repo_slug || '';
+                  if (!repoForPr && evt.pr_id) {
+                    for (var k = 0; k < fridayPrs.length; k++) {
+                      var row = fridayPrs[k];
+                      if (String(row.pr_id) === String(evt.pr_id) && row.repo_slug) {
+                        repoForPr = row.repo_slug;
+                        break;
+                      }
+                    }
+                  }
+                  if (repoForPr) {
+                    commitUrl = 'https://api.bitbucket.org/2.0/repositories/' +
+                      repoForPr + '/commit/' + evt.sha;
+                  }
+                }
+                routerEvent.commit_url = commitUrl;
+              } else if (evt.event_type === 'comment') {
+                routerEvent.pr_id = evt.pr_id || '';
+                routerEvent.comment_id = evt.comment_id;
+                routerEvent.comment_body = evt.comment_body || '';
+                routerEvent.commit_sha = evt.sha || '';
+                routerEvent.author = evt.author || '';
+              } else if (evt.event_type === 'merged') {
+                routerEvent.pr_id = evt.pr_id || '';
+                routerEvent.merge_commit = evt.merge_commit || '';
+              }
+
+              var config = {
+                ci_status_keys: ["BITBUCKET-PIPELINES"],
+                actionable_prefixes: ["@friday", "/friday"],
+                max_ci_consecutive_attempts_without_comment_reset: 3,
+                max_total_pushes_per_pr: 10,
+              };
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('jira-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'router-operation',
+                type: 'router-operation',
+                data: {
+                  operation: 'webhook',
+                  event: routerEvent,
+                  friday_prs: fridayPrs,
+                  pr_events: prEvents,
+                  config: config,
+                },
+              });
+
+              return {
+                task: 'Route PR event via jira-bugfix-pr-router',
+                config: {
+                  operation: 'webhook',
+                  event: routerEvent,
+                  friday_prs: fridayPrs,
+                  pr_events: prEvents,
+                  config: config,
+                },
+              };
+            }
+
+        dispatch_router_decision:
+          type: action
+          code: |
+            export default function dispatch_router_decision(context, event) {
+              var output = context.results['router-output'] || {};
+              var decision = output.action
+                ? output
+                : (output.data && output.data.action)
+                  ? output.data
+                  : {};
+
+              if (!decision.action) {
+                throw new Error(
+                  'router-output did not carry a decision action: ' + JSON.stringify(output)
+                );
+              }
+
+              context.setResult('router-decision', decision);
+
+              switch (decision.action) {
+                case 'drop':
+                  context.emit({ type: 'ROUTER_DROP' });
+                  return;
+                case 'fix_ci':
+                  context.emit({ type: 'ROUTER_FIX_CI' });
+                  return;
+                case 'fix_comment':
+                  context.emit({ type: 'ROUTER_FIX_COMMENT' });
+                  return;
+                case 'record_merged':
+                  context.emit({ type: 'ROUTER_RECORD_MERGED' });
+                  return;
+                case 'escalate':
+                  context.emit({ type: 'ROUTER_ESCALATE' });
+                  return;
+                case 'noop':
+                  context.emit({ type: 'ROUTER_NOOP' });
+                  return;
+                default:
+                  throw new Error('Unknown router decision action: ' + decision.action);
+              }
+            }
+
+        # Record a dropped event from the router. The decision's `reason`
+        # names the gate that rejected it.
+        record_router_drop:
+          type: action
+          code: |
+            export default function record_router_drop(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var evt = context.results['router-event'] || {};
+              context.stateAppend('pr-events', {
+                pr_id: decision.pr_id || evt.pr_id || '',
+                type: 'dropped',
+                sha: evt.sha || '',
+                trigger: decision.reason || 'not_friday_owned',
+                event_type: evt.event_type || '',
+                ts: new Date().toISOString(),
+              }, 168);
+            }
+
+        # Clone the PR's branch for the CI prelude. Uses the router's
+        # decision payload (pr_id + branch + repo_url) rather than a state
+        # cache lookup — the router already resolved ownership.
+        prepare_clone_for_ci_router:
+          type: action
+          code: |
+            export default function prepare_clone_for_ci_router(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var repoUrl = decision.repo_url || '';
+              var branch = decision.branch || '';
+              if (!repoUrl) throw new Error('router-decision missing repo_url for CI clone');
+              if (!branch) throw new Error('router-decision missing branch for CI clone');
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.deleteDoc('router-operation');
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'repo-clone',
+                  repo_url: repoUrl,
+                  branch: branch,
+                },
+              });
+              return {
+                task: 'Clone ' + repoUrl + ' branch ' + branch + ' for CI fix',
+                config: { operation: 'repo-clone', repo_url: repoUrl, branch: branch },
+              };
+            }
+
+        # Comment prelude: read unresolved threads on the PR. Uses the
+        # router's decision payload for the PR URL.
+        prepare_gather_context_router:
+          type: action
+          code: |
+            export default function prepare_gather_context_router(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var repoUrl = decision.repo_url || '';
+              var prId = decision.pr_id || '';
+              if (!repoUrl) throw new Error('router-decision missing repo_url for comment gather');
+              if (!prId) throw new Error('router-decision missing pr_id for comment gather');
+              var prUrl = repoUrl.replace(/\/+$/, '') + '/pull-requests/' + prId;
+
+              var record = {
+                pr_id: prId,
+                branch: decision.branch || '',
+                repo_slug: decision.repo_slug || '',
+                repo_url: repoUrl,
+                pr_url: prUrl,
+                ticket_key: decision.ticket_key || '',
+              };
+              context.setResult('comment-pr-record', record);
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('router-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-read-threads',
+                  pr_url: prUrl,
+                },
+              });
+              return {
+                task: 'Read unresolved threads on PR ' + prUrl,
+                config: { operation: 'pr-read-threads', pr_url: prUrl },
+              };
+            }
+
+        # Clone the PR's branch for the comment prelude.
+        prepare_clone_for_comment_router:
+          type: action
+          code: |
+            export default function prepare_clone_for_comment_router(context, event) {
+              var record = context.results['comment-pr-record'] || {};
+              var decision = context.results['router-decision'] || {};
+              var repoUrl = record.repo_url || decision.repo_url || '';
+              var branch = record.branch || decision.branch || '';
+              if (!repoUrl) throw new Error('No repo_url for comment clone');
+              if (!branch) throw new Error('No branch for comment clone');
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'repo-clone',
+                  repo_url: repoUrl,
+                  branch: branch,
+                },
+              });
+              return {
+                task: 'Clone ' + repoUrl + ' branch ' + branch + ' for comment fix',
+                config: { operation: 'repo-clone', repo_url: repoUrl, branch: branch },
+              };
+            }
+
+        # Gather source-specific context for the remediate tail's LLM
+        # action. Reads `source` (ci / comment) from the router's decision
+        # and assembles all the raw data the LLM needs to synthesize a
+        # task prompt for claude-code. Source="initial" is handled by the
+        # fix-bug job's own prepare_implement function, not this one.
+        gather_remediate_context:
+          type: action
+          code: |
+            export default function gather_remediate_context(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var source = decision.source || '';
+              var fixInput = { source: source, pr_id: decision.pr_id || '' };
+
+              if (source === 'ci') {
+                var ciClone = context.results['ci-clone-output'] || {};
+                var ciCloneData = ciClone.data || {};
+                var loop = context.results['log-loop-state'] || { collected: [] };
+                fixInput.workDir = ciCloneData.path || '';
+                fixInput.branch = decision.branch || ciCloneData.branch || '';
+                fixInput.commit_sha = decision.sha || '';
+                fixInput.failed_steps = loop.collected || [];
+              } else if (source === 'comment') {
+                var commentClone = context.results['comment-clone-output'] || {};
+                var commentCloneData = commentClone.data || {};
+                var threadsOutput = context.results['threads-output'] || {};
+                var threadsData = threadsOutput.data || {};
+                fixInput.workDir = commentCloneData.path || '';
+                fixInput.branch = decision.branch || commentCloneData.branch || '';
+                fixInput.commit_sha = decision.sha || '';
+                fixInput.originating_comment = {
+                  comment_id: decision.comment_id,
+                  body: decision.comment_body || '',
+                  author: '',
+                };
+                fixInput.unresolved_threads = threadsData.threads || [];
+              } else {
+                throw new Error('gather_remediate_context: unsupported source: ' + source);
+              }
+
+              return {
+                task: 'Gather ' + source + '-triggered fix context',
+                config: fixInput,
+              };
+            }
+
+        # Read the LLM-synthesized remediate-fix-input from results and
+        # return it as { task, config } so the downstream claude-code agent
+        # receives workDir via prepareResult (required to reuse the clone).
+        stage_remediate_fix:
+          type: action
+          code: |
+            export default function stage_remediate_fix(context, event) {
+              var fixInput = context.results['remediate-fix-input'] || {};
+              var source = fixInput.source || 'unknown';
+              return {
+                task: 'Apply ' + source + '-triggered fix',
+                config: fixInput,
+              };
+            }
+
+        guard_fix_output_done:
+          type: guard
+          code: |
+            export default function guard_fix_output_done(context, event) {
+              return context.results['fix-output'] !== undefined;
+            }
+
+        # Stage the push operation. Source-agnostic — we always push the
+        # same branch to the same repo_url, derived from the router's
+        # decision payload.
+        prepare_remediate_push:
+          type: action
+          code: |
+            export default function prepare_remediate_push(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var source = decision.source || '';
+              var fix = context.results['fix-output'] || {};
+
+              var workDir = '';
+              if (source === 'ci') {
+                var ciClone = context.results['ci-clone-output'] || {};
+                workDir = (ciClone.data || {}).path || '';
+              } else if (source === 'comment') {
+                var commentClone = context.results['comment-clone-output'] || {};
+                workDir = (commentClone.data || {}).path || '';
+              } else if (source === 'initial') {
+                var initial = context.results['remediate-initial-input'] || {};
+                workDir = initial.workDir || '';
+              }
+              if (!workDir) throw new Error('Cannot push: no clone path for source ' + source);
+
+              var branch = fix.branch_name || decision.branch || '';
+              if (!branch) throw new Error('Cannot push: no branch resolved');
+              var repoUrl = decision.repo_url || '';
+              if (!repoUrl) throw new Error('Cannot push: no repo_url on router decision');
+
+              try { context.deleteDoc('jira-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'repo-push',
+                  path: workDir,
+                  branch: branch,
+                  repo_url: repoUrl,
+                },
+              });
+              return {
+                task: 'Push ' + source + '-driven fix to ' + branch,
+                config: { operation: 'repo-push', branch: branch, repo_url: repoUrl },
+              };
+            }
+
+        # Post-success dispatcher — switches on source to run the
+        # source-specific record action. Also propagates push-failure into
+        # the shared escalate path.
+        dispatch_source:
+          type: action
+          code: |
+            export default function dispatch_source(context, event) {
+              var pushOutput = context.results['remediate-push-output'] || {};
+              if (pushOutput.success !== true) {
+                context.emit({ type: 'PUSH_FAILED' });
+                return;
+              }
+              var decision = context.results['router-decision'] || {};
+              var source = decision.source || '';
+              if (source === 'ci') {
+                context.emit({ type: 'SOURCE_CI' });
+                return;
+              }
+              if (source === 'comment') {
+                context.emit({ type: 'SOURCE_COMMENT' });
+                return;
+              }
+              throw new Error('dispatch_source: unsupported source: ' + source);
+            }
+
+        # Append a ci_triaged + fix_pushed pr-events row for the new SHA,
+        # plus a fresh friday-prs row so the stale-sha gate accepts the new
+        # commit on the next webhook. Merges both halves of the old
+        # record_ci_triaged + record_fix_pushed flow so the router's
+        # fix_ci → push → record path touches state once.
+        record_remediate_ci:
+          type: action
+          code: |
+            export default function record_remediate_ci(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var fix = context.results['fix-output'] || {};
+              var loop = context.results['log-loop-state'] || { collected: [] };
+              var ts = new Date().toISOString();
+              var prId = decision.pr_id || '';
+              var newSha = fix.commit_sha || '';
+
+              context.stateAppend('pr-events', {
+                pr_id: prId,
+                type: 'ci_triaged',
+                sha: decision.sha || '',
+                details: { failed_steps: loop.collected || [] },
+                ts: ts,
+              }, 168);
+
+              context.stateAppend('pr-events', {
+                pr_id: prId,
+                type: 'fix_pushed',
+                sha: newSha,
+                trigger: 'ci',
+                ts: ts,
+              }, 168);
+
+              context.stateAppend('friday-prs', {
+                pr_id: prId,
+                ticket_key: decision.ticket_key || '',
+                sha: newSha,
+                branch: decision.branch || '',
+                repo_slug: decision.repo_slug || '',
+                repo_url: decision.repo_url || '',
+              }, 168);
+            }
+
+        # Append a fix_pushed pr-events row (trigger='comment') and a fresh
+        # friday-prs row.
+        record_remediate_comment:
+          type: action
+          code: |
+            export default function record_remediate_comment(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var fix = context.results['fix-output'] || {};
+              var ts = new Date().toISOString();
+              var prId = decision.pr_id || '';
+              var newSha = fix.commit_sha || '';
+
+              context.stateAppend('pr-events', {
+                pr_id: prId,
+                type: 'fix_pushed',
+                sha: newSha,
+                trigger: 'comment',
+                ts: ts,
+              }, 168);
+
+              context.stateAppend('friday-prs', {
+                pr_id: prId,
+                ticket_key: decision.ticket_key || '',
+                sha: newSha,
+                branch: decision.branch || '',
+                repo_slug: decision.repo_slug || '',
+                repo_url: decision.repo_url || '',
+              }, 168);
+            }
+
+        # Gather context for the PR reply LLM. Reads the originating
+        # comment from the router decision and fix output.
+        gather_pr_reply_context:
+          type: action
+          code: |
+            export default function gather_pr_reply_context(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var record = context.results['comment-pr-record'] || {};
+              var fix = context.results['fix-output'] || {};
+              var prUrl = record.pr_url || '';
+              if (!prUrl) throw new Error('comment-pr-record missing pr_url');
+
+              var commentIdRaw = decision.comment_id;
+              var commentId = typeof commentIdRaw === 'number'
+                ? commentIdRaw
+                : Number(commentIdRaw);
+              if (!commentId || isNaN(commentId)) {
+                throw new Error('No originating comment_id — cannot scope reply to thread');
+              }
+
+              context.setResult('pr-reply-context', {
+                pr_url: prUrl,
+                comment_id: commentId,
+                commit_sha: fix.commit_sha || '',
+              });
+
+              return {
+                task: 'Gather PR reply context for comment ' + commentId,
+                config: {
+                  originating_comment: {
+                    comment_id: commentId,
+                    body: decision.comment_body || '',
+                  },
+                  fix_summary: fix.summary || fix.commit_message || 'Applied requested change.',
+                  commit_sha: fix.commit_sha || '',
+                },
+              };
+            }
+
+        # Stage the bb-operation doc after the LLM has synthesized the
+        # PR reply body.
+        stage_pr_reply:
+          type: action
+          code: |
+            export default function stage_pr_reply(context, event) {
+              var replyCtx = context.results['pr-reply-context'] || {};
+              var prUrl = replyCtx.pr_url || '';
+              var commentId = replyCtx.comment_id;
+              var sha = replyCtx.commit_sha || '';
+
+              var replyMsg = context.results['pr-reply-message'] || {};
+              var replyBody = replyMsg.body || 'Applied requested change.';
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-post-followup',
+                  pr_url: prUrl,
+                  commit_id: sha,
+                  thread_replies: [{ comment_id: commentId, body: replyBody }],
+                  new_findings: [],
+                  summary: replyBody,
+                },
+              });
+              return {
+                task: 'Reply to comment ' + commentId + ' on ' + prUrl,
+                config: {
+                  operation: 'pr-post-followup',
+                  pr_url: prUrl,
+                  reply_to: commentId,
+                },
+              };
+            }
+
+        guard_remediate_respond_done:
+          type: guard
+          code: |
+            export default function guard_remediate_respond_done(context, event) {
+              return context.results['remediate-respond-output'] !== undefined;
+            }
+
+        # Record a merged PR from the router's record_merged decision.
+        record_merged_router:
+          type: action
+          code: |
+            export default function record_merged_router(context, event) {
+              var decision = context.results['router-decision'] || {};
+              context.stateAppend('pr-events', {
+                pr_id: decision.pr_id || '',
+                type: 'merged',
+                merge_commit: decision.merge_commit ? String(decision.merge_commit) : '',
+                ts: new Date().toISOString(),
+              }, 168);
+            }
+
+        # Shared escalate: entered by router's `escalate` decision OR by
+        # the remediate tail on failed / crashed outcomes. Gathers context
+        # for the LLM to synthesize the Jira comment body.
+        gather_escalate_context:
+          type: action
+          code: |
+            export default function gather_escalate_context(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var fix = context.results['fix-output'] || {};
+              var evt = context.results['router-event'] || {};
+              var stateCache = context.results.__stateCache || {};
+              var fridayPrs = stateCache['friday-prs'] || [];
+              var prEvents = stateCache['pr-events'] || [];
+              var prId = String(decision.pr_id || evt.pr_id || '');
+
+              var ticketKey = decision.ticket_key || '';
+              var prUrl = '';
+              if (decision.repo_url) {
+                prUrl = decision.repo_url.replace(/\/+$/, '') + '/pull-requests/' + prId;
+              }
+              if (!ticketKey || !prUrl) {
+                for (var i = 0; i < fridayPrs.length; i++) {
+                  try {
+                    var row = JSON.parse(fridayPrs[i].data);
+                    if (String(row.pr_id || '') === prId) {
+                      if (!ticketKey && row.ticket_key) ticketKey = row.ticket_key;
+                      if (!prUrl && row.repo_url) {
+                        prUrl = row.repo_url.replace(/\/+$/, '') + '/pull-requests/' + prId;
+                      }
+                    }
+                  } catch (e) { /* skip */ }
+                }
+              }
+              if (!ticketKey) {
+                throw new Error('Cannot escalate on Jira: no ticket_key for pr_id ' + prId);
+              }
+
+              context.setResult('shared-escalate-summary', {
+                pr_url: prUrl,
+                ticket_key: ticketKey,
+              });
+
+              var related = [];
+              for (var k = 0; k < prEvents.length; k++) {
+                try {
+                  var ev = JSON.parse(prEvents[k].data);
+                  if (String(ev.pr_id || '') === prId) {
+                    related.push({ ts: prEvents[k]._ts, entry: ev });
+                  }
+                } catch (e) { /* skip */ }
+              }
+              related.sort(function (a, b) { return a.ts < b.ts ? -1 : 1; });
+              var prEventSlice = related.slice(Math.max(0, related.length - 10));
+
+              try { context.deleteDoc('jira-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('router-operation'); } catch (e) { /* no-op */ }
+
+              return {
+                task: 'Gather escalation context for PR ' + prId,
+                config: {
+                  decision: {
+                    action: decision.action || '',
+                    pr_id: prId,
+                    reason: decision.reason || {},
+                  },
+                  fix_output: {
+                    summary: fix.summary || '',
+                  },
+                  pr_url: prUrl,
+                  ticket_key: ticketKey,
+                  pr_events: prEventSlice,
+                },
+              };
+            }
+
+        # Stage the jira-operation doc after the LLM has synthesized the
+        # escalation comment body.
+        stage_escalate_jira:
+          type: action
+          code: |
+            export default function stage_escalate_jira(context, event) {
+              var summary = context.results['shared-escalate-summary'] || {};
+              var ticketKey = summary.ticket_key || '';
+              if (!ticketKey) {
+                throw new Error('stage_escalate_jira: no ticket_key in shared-escalate-summary');
+              }
+
+              var escalateMsg = context.results['escalate-message'] || {};
+              var body = escalateMsg.body || 'Friday is escalating this PR. A human needs to take over.';
+
+              context.setResult('shared-escalate-summary', {
+                body: body,
+                pr_url: summary.pr_url || '',
+                ticket_key: ticketKey,
+              });
+
+              context.createDoc({
+                id: 'jira-operation',
+                type: 'jira-operation',
+                data: {
+                  operation: 'issue-comment',
+                  issue_key: ticketKey,
+                  body: body,
+                },
+              });
+              return {
+                task: 'Escalate on Jira ticket ' + ticketKey,
+                config: { operation: 'issue-comment', issue_key: ticketKey },
+              };
+            }
+
+        # PR comment half of shared escalation. Emits SKIP_PR when no PR
+        # URL is available so the bb agent step is bypassed entirely — the
+        # `bb` agent has no noop op, so "skip this agent" must be modeled
+        # as a transition, not a fake operation. Emits HAS_PR when a real
+        # pr-post-followup is staged.
+        prepare_shared_escalate_pr:
+          type: action
+          code: |
+            export default function prepare_shared_escalate_pr(context, event) {
+              var summary = context.results['shared-escalate-summary'] || {};
+              var prUrl = summary.pr_url || '';
+              if (!prUrl) {
+                context.emit({ type: 'SKIP_PR' });
+                return;
+              }
+              var body = summary.body || 'Friday is escalating this PR.';
+
+              try { context.deleteDoc('jira-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-post-followup',
+                  pr_url: prUrl,
+                  thread_replies: [],
+                  new_findings: [],
+                  summary: body,
+                },
+              });
+              context.emit({ type: 'HAS_PR' });
+              return {
+                task: 'Escalate on PR ' + prUrl,
+                config: { operation: 'pr-post-followup', pr_url: prUrl },
+              };
+            }
+
+        # Final breadcrumb: append an `escalated` pr-events row. The lifecycle
+        # gate in the router (_has_lifecycle_row('escalated')) drops future
+        # events for this PR except actionable comments.
+        record_shared_escalated:
+          type: action
+          code: |
+            export default function record_shared_escalated(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var evt = context.results['router-event'] || {};
+              var prId = decision.pr_id || evt.pr_id || '';
+              var trigger = '';
+              if (decision.action === 'escalate' && decision.reason) {
+                trigger = decision.reason.trigger || '';
+              } else {
+                trigger = 'agent_failed';
+              }
+              context.stateAppend('pr-events', {
+                pr_id: prId,
+                type: 'escalated',
+                sha: evt.sha || '',
+                trigger: trigger,
+                ts: new Date().toISOString(),
+              }, 168);
+            }
+
+        # ---------------------------------------------------------------
+        # CI prelude helpers — used by the router flow's CI branch.
+        # ---------------------------------------------------------------
+
+        prepare_list_pipelines:
+          type: action
+          code: |
+            export default function prepare_list_pipelines(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var repoSlug = decision.repo_slug || '';
+              var sha = decision.sha || '';
+              if (!repoSlug) throw new Error('router-decision missing repo_slug for list-pipelines');
+              if (!sha) throw new Error('router-decision missing sha for list-pipelines');
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* may not exist */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'bb-list-pipelines-for-commit',
+                  repo_slug: repoSlug,
+                  commit_sha: sha,
+                },
+              });
+              return {
+                task: 'List pipelines for commit ' + sha,
+                config: {
+                  operation: 'bb-list-pipelines-for-commit',
+                  repo_slug: repoSlug,
+                  commit_sha: sha,
+                },
+              };
+            }
+
+        guard_pipelines_done:
+          type: guard
+          code: |
+            export default function guard_pipelines_done(context, event) {
+              return context.results['pipelines-output'] !== undefined;
+            }
+
+        prepare_get_steps:
+          type: action
+          code: |
+            export default function prepare_get_steps(context, event) {
+              var decision = context.results['router-decision'] || {};
+              var repoSlug = decision.repo_slug || '';
+              var sha = decision.sha || '';
+              if (!repoSlug) throw new Error('router-decision missing repo_slug for get-steps');
+              var pipelinesOutput = context.results['pipelines-output'] || {};
+              var data = pipelinesOutput.data || {};
+              var pipelines = data.pipelines || [];
+              var firstFailed = null;
+              for (var i = 0; i < pipelines.length; i++) {
+                if (pipelines[i].state === 'FAILED') {
+                  firstFailed = pipelines[i];
+                  break;
+                }
+              }
+              if (!firstFailed) {
+                throw new Error(
+                  'No FAILED pipeline found for sha ' + sha +
+                  ' — refusing to triage. Bitbucket may have already retried.'
+                );
+              }
+              context.setResult('selected-pipeline', firstFailed);
+
+              context.deleteDoc('bb-operation');
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'bb-get-pipeline-steps',
+                  repo_slug: repoSlug,
+                  pipeline_uuid: firstFailed.pipeline_uuid,
+                },
+              });
+              return {
+                task: 'Get steps for pipeline ' + firstFailed.pipeline_uuid,
+                config: {
+                  operation: 'bb-get-pipeline-steps',
+                  repo_slug: repoSlug,
+                  pipeline_uuid: firstFailed.pipeline_uuid,
+                },
+              };
+            }
+
+        guard_steps_done:
+          type: guard
+          code: |
+            export default function guard_steps_done(context, event) {
+              return context.results['steps-output'] !== undefined;
+            }
+
+        prepare_fetch_step_log:
+          type: action
+          code: |
+            export default function prepare_fetch_step_log(context, event) {
+              var MAX_FAILED_STEPS = 5;
+              var decision = context.results['router-decision'] || {};
+              var repoSlug = decision.repo_slug || '';
+              if (!repoSlug) throw new Error('router-decision missing repo_slug for fetch-step-log');
+              var stepsOutput = context.results['steps-output'] || {};
+              var stepsData = stepsOutput.data || {};
+              var allSteps = stepsData.steps || [];
+              var loop = context.results['log-loop-state'];
+
+              if (!loop) {
+                var failed = [];
+                for (var i = 0; i < allSteps.length && failed.length < MAX_FAILED_STEPS; i++) {
+                  if (allSteps[i].state === 'FAILED') failed.push(allSteps[i]);
+                }
+                loop = { iter: 0, queue: failed, collected: [] };
+                context.setResult('log-loop-state', loop);
+              }
+
+              if (loop.iter >= loop.queue.length) {
+                context.emit({ type: 'LOG_DONE' });
+                return;
+              }
+
+              var nextStep = loop.queue[loop.iter];
+              var pipelineUuid = stepsData.pipeline_uuid || '';
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'bb-get-step-log',
+                  repo_slug: repoSlug,
+                  pipeline_uuid: pipelineUuid,
+                  step_uuid: nextStep.step_uuid,
+                },
+              });
+              context.setResult('log-loop-current', {
+                step_name: nextStep.name || '',
+                step_uuid: nextStep.step_uuid,
+              });
+              context.emit({ type: 'LOG_NEXT' });
+
+              return {
+                task: 'Fetch log for step ' + (nextStep.name || nextStep.step_uuid) +
+                  ' (' + (loop.iter + 1) + ' of ' + loop.queue.length + ')',
+                config: {
+                  operation: 'bb-get-step-log',
+                  repo_slug: repoSlug,
+                  pipeline_uuid: pipelineUuid,
+                  step_uuid: nextStep.step_uuid,
+                },
+              };
+            }
+
+        collect_step_log:
+          type: action
+          code: |
+            export default function collect_step_log(context, event) {
+              var loop = context.results['log-loop-state'] || { iter: 0, queue: [], collected: [] };
+              var current = context.results['log-loop-current'] || {};
+              var output = context.results['step-log-output'] || {};
+              var logData = output.data || {};
+              var collected = loop.collected.slice();
+              collected.push({
+                name: current.step_name || '',
+                tail: logData.tail || '',
+                matched_lines: logData.matched_lines || [],
+                full_log_url: logData.full_log_url || '',
+              });
+              context.setResult('log-loop-state', {
+                iter: loop.iter + 1,
+                queue: loop.queue,
+                collected: collected,
+              });
+            }
+
+        guard_ci_clone_done:
+          type: guard
+          code: |
+            export default function guard_ci_clone_done(context, event) {
+              return context.results['ci-clone-output'] !== undefined;
+            }
+
+        guard_threads_done:
+          type: guard
+          code: |
+            export default function guard_threads_done(context, event) {
+              return context.results['threads-output'] !== undefined;
+            }
+
+        guard_comment_clone_done:
+          type: guard
+          code: |
+            export default function guard_comment_clone_done(context, event) {
+              return context.results['comment-clone-output'] !== undefined;
+            }
+
+      documentTypes:
+        # Input document for the jira-bugfix-pr-router agent. Shape mirrors
+        # the router's WebhookInput dataclass in agent.py.
+        router-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            event:
+              type: object
+            friday_prs:
+              type: array
+              items: { type: object }
+            pr_events:
+              type: array
+              items: { type: object }
+            config:
+              type: object
+          required: [operation, event]
+
+        router-decision:
+          type: object
+          properties:
+            action:
+              enum: [drop, fix_ci, fix_comment, record_merged, escalate, noop]
+            reason: {}
+            pr_id: { type: string }
+            sha: { type: string }
+            branch: { type: string }
+            repo_slug: { type: string }
+            repo_url: { type: string }
+            ticket_key: { type: string }
+            source: { type: string }
+            comment_id: {}
+            comment_body: { type: string }
+            thread:
+              type: object
+            merge_commit: { type: string }
+          required: [action]
+
+        jira-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            issue_key: { type: string }
+            body: { type: string }
+            transition_name: { type: string }
+          required:
+            - operation
+
+        jira-ticket:
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+          required: [operation, success]
+
+        bb-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            repo_slug: { type: string }
+            commit_sha: { type: string }
+            pipeline_uuid: { type: string }
+            step_uuid: { type: string }
+            repo_url: { type: string }
+            branch: { type: string }
+            path: { type: string }
+            pr_url: { type: string }
+            commit_id: { type: string }
+            summary: { type: string }
+            issue_key: { type: string }
+            body: { type: string }
+            thread_replies:
+              type: array
+              items:
+                type: object
+                properties:
+                  comment_id: { type: number }
+                  body: { type: string }
+            new_findings:
+              type: array
+              items: { type: object }
+          required:
+            - operation
+
+        bb-result: &bb-result
+          type: object
+          properties:
+            operation: { type: string }
+            success: { type: boolean }
+            data:
+              type: object
+          required: [operation, success]
+
+        clone-result: *clone-result
+
+        push-result: *push-result
+
+        fix-result: *fix-result
+
+        # LLM action output types
+        escalation-text:
+          type: object
+          properties:
+            body: { type: string }
+          required: [body]
+
+        pr-reply-text:
+          type: object
+          properties:
+            body: { type: string }
+          required: [body]
+
+        remediate-fix-input:
+          type: object
+          properties:
+            task_prompt: { type: string }
+            workDir: { type: string }
+            branch: { type: string }
+            source: { type: string }
+            pr_id: { type: string }
+            commit_sha: { type: string }
+            failed_steps:
+              type: array
+              items: { type: object }
+            originating_comment: { type: object }
+            unresolved_threads:
+              type: array
+              items: { type: object }
+          required: [task_prompt, workDir, branch, source, pr_id]
+
+      tools: {}
+
+  reconcile-prs:
+    title: Reconcile Friday-owned PRs
+    description: >-
+      Every 10 minutes, walk every row in `friday-prs`, query Bitbucket for
+      current CI / comment / merge state, and fan out synthetic pr-events for
+      anything unresolved that has no matching pr-events breadcrumb.
+    triggers:
+      - signal: reconcile-prs
+    fsm:
+      id: reconcile-prs-pipeline
+      initial: idle
+      states:
+        idle:
+          entry:
+            - type: code
+              function: init_reconciler
+          'on':
+            reconcile-prs:
+              target: step_list_friday_prs
+
+        step_list_friday_prs:
+          entry:
+            - type: code
+              function: build_pr_queue
+          'on':
+            ADVANCE:
+              target: step_for_each_pr
+
+        step_for_each_pr:
+          entry:
+            - type: code
+              function: next_pr_or_done
+          'on':
+            PR_NEXT:
+              target: step_check_pr_state
+            NO_MORE:
+              target: completed
+
+        step_check_pr_state:
+          entry:
+            - type: code
+              function: prepare_fetch_commit_statuses
+            - type: agent
+              agentId: bb
+              outputTo: commit-statuses-output
+              outputType: bb-result
+              prompt: Execute Bitbucket bb-get-commit-statuses operation.
+            - type: code
+              function: prepare_fetch_threads
+            - type: agent
+              agentId: bb
+              outputTo: threads-output
+              outputType: bb-result
+              prompt: Execute Bitbucket pr-read-threads operation.
+            - type: code
+              function: prepare_fetch_pr_view
+            - type: agent
+              agentId: bb
+              outputTo: pr-view-output
+              outputType: bb-result
+              prompt: Execute Bitbucket pr-view operation.
+            - type: code
+              function: build_reconcile_router_input
+            - type: agent
+              agentId: jira-bugfix-pr-router
+              outputTo: reconcile-router-output
+              outputType: reconcile-fanouts
+              prompt: Execute jira-bugfix-pr-router reconcile operation.
+            - type: code
+              function: record_reconcile_router_output
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_fanout_next
+
+        step_fanout_next:
+          entry:
+            - type: code
+              function: fanout_next_or_advance
+          'on':
+            FANOUT:
+              target: step_fanout_post
+            ADVANCE:
+              target: step_for_each_pr
+
+        step_fanout_post:
+          entry:
+            - type: code
+              function: fanout_post
+            - type: emit
+              event: ADVANCE
+          'on':
+            ADVANCE:
+              target: step_fanout_next
+
+        completed:
+          type: final
+
+      functions:
+        init_reconciler:
+          type: action
+          code: |
+            export default function init_reconciler(context, event) {
+              context.setResult('reconciler-state', {
+                sweep_ts: new Date().toISOString(),
+                pr_queue: [],
+                pr_index: 0,
+                fanout_queue: [],
+                fanout_index: 0,
+                fanout_stats: { triggered: 0 },
+              });
+            }
+
+        build_pr_queue:
+          type: action
+          code: |
+            export default function build_pr_queue(context, event) {
+              var stateCache = context.results.__stateCache || {};
+              var rows = stateCache['friday-prs'] || [];
+
+              var byPrId = {};
+              for (var i = 0; i < rows.length; i++) {
+                try {
+                  var entry = JSON.parse(rows[i].data);
+                  if (!entry || typeof entry !== 'object') continue;
+                  var prId = String(entry.pr_id || '');
+                  if (!prId) continue;
+                  var ts = rows[i]._ts || '';
+                  if (!byPrId[prId] || byPrId[prId].ts < ts) {
+                    byPrId[prId] = { entry: entry, ts: ts };
+                  }
+                } catch (e) {
+                }
+              }
+
+              var queue = [];
+              for (var key in byPrId) {
+                queue.push(byPrId[key].entry);
+              }
+
+              var state = context.results['reconciler-state'] || {};
+              state.pr_queue = queue;
+              context.setResult('reconciler-state', state);
+              context.emit({ type: 'ADVANCE' });
+            }
+
+        next_pr_or_done:
+          type: action
+          code: |
+            export default function next_pr_or_done(context, event) {
+              var state = context.results['reconciler-state'] || {};
+              var queue = state.pr_queue || [];
+              var idx = state.pr_index || 0;
+
+              if (idx >= queue.length) {
+                context.setResult('reconciler-summary', {
+                  sweep_ts: state.sweep_ts || '',
+                  prs_scanned: queue.length,
+                  signals_triggered: (state.fanout_stats || {}).triggered || 0,
+                });
+                context.emit({ type: 'NO_MORE' });
+                return;
+              }
+
+              var pr = queue[idx] || {};
+              context.setResult('current-pr', {
+                pr_id: String(pr.pr_id || ''),
+                sha: pr.sha || '',
+                branch: pr.branch || '',
+                repo_slug: pr.repo_slug || '',
+                repo_url: pr.repo_url || '',
+              });
+              context.emit({ type: 'PR_NEXT' });
+            }
+
+        prepare_fetch_commit_statuses:
+          type: action
+          code: |
+            export default function prepare_fetch_commit_statuses(context, event) {
+              var pr = context.results['current-pr'] || {};
+              if (!pr.repo_slug || !pr.sha) {
+                throw new Error('current-pr missing repo_slug or sha');
+              }
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* may not exist */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'bb-get-commit-statuses',
+                  repo_slug: pr.repo_slug,
+                  commit_sha: pr.sha,
+                },
+              });
+              return {
+                task: 'Fetch commit statuses for ' + pr.repo_slug + ' @ ' + pr.sha,
+                config: {
+                  operation: 'bb-get-commit-statuses',
+                  repo_slug: pr.repo_slug,
+                  commit_sha: pr.sha,
+                },
+              };
+            }
+
+        prepare_fetch_threads:
+          type: action
+          code: |
+            export default function prepare_fetch_threads(context, event) {
+              var pr = context.results['current-pr'] || {};
+              var repoUrl = pr.repo_url || '';
+              if (!repoUrl || !pr.pr_id) {
+                throw new Error('current-pr missing repo_url or pr_id');
+              }
+              var prUrl = repoUrl.replace(/\/$/, '') + '/pull-requests/' + pr.pr_id;
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* may not exist */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-read-threads',
+                  pr_url: prUrl,
+                },
+              });
+              return {
+                task: 'Read threads for PR ' + pr.pr_id,
+                config: { operation: 'pr-read-threads', pr_url: prUrl },
+              };
+            }
+
+        prepare_fetch_pr_view:
+          type: action
+          code: |
+            export default function prepare_fetch_pr_view(context, event) {
+              var pr = context.results['current-pr'] || {};
+              var repoUrl = pr.repo_url || '';
+              if (!repoUrl || !pr.pr_id) {
+                throw new Error('current-pr missing repo_url or pr_id');
+              }
+              var prUrl = repoUrl.replace(/\/$/, '') + '/pull-requests/' + pr.pr_id;
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* may not exist */ }
+              context.createDoc({
+                id: 'bb-operation',
+                type: 'bb-operation',
+                data: {
+                  operation: 'pr-view',
+                  pr_url: prUrl,
+                },
+              });
+              return {
+                task: 'View PR ' + pr.pr_id,
+                config: { operation: 'pr-view', pr_url: prUrl },
+              };
+            }
+
+        # Build the input doc for the router's reconcile operation. The
+        # router filters pr_events by friday_pr.pr_id internally and applies
+        # the same gate logic as the webhook path — no inline prefilter here.
+        build_reconcile_router_input:
+          type: action
+          code: |
+            export default function build_reconcile_router_input(context, event) {
+              var pr = context.results['current-pr'] || {};
+              var stateCache = context.results.__stateCache || {};
+              var prEventRows = stateCache['pr-events'] || [];
+
+              var prEvents = [];
+              for (var i = 0; i < prEventRows.length; i++) {
+                try {
+                  var entry = JSON.parse(prEventRows[i].data);
+                  if (!entry || typeof entry !== 'object') continue;
+                  entry._ts = prEventRows[i]._ts;
+                  prEvents.push(entry);
+                } catch (e) { /* skip */ }
+              }
+
+              var statusesOut = context.results['commit-statuses-output'] || {};
+              var threadsOut = context.results['threads-output'] || {};
+              var prViewOut = context.results['pr-view-output'] || {};
+              var bbState = {
+                commit_statuses: (statusesOut.data || {}).statuses || [],
+                threads: (threadsOut.data || {}).threads || [],
+                pr_view: prViewOut.data || {},
+              };
+
+              var fridayPr = {
+                pr_id: String(pr.pr_id || ''),
+                sha: pr.sha || '',
+                branch: pr.branch || '',
+                repo_slug: pr.repo_slug || '',
+                repo_url: pr.repo_url || '',
+              };
+
+              var config = {
+                ci_status_keys: ["BITBUCKET-PIPELINES"],
+                actionable_prefixes: ["@friday", "/friday"],
+                max_ci_consecutive_attempts_without_comment_reset: 3,
+                max_total_pushes_per_pr: 10,
+              };
+
+              try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
+              try { context.deleteDoc('router-operation'); } catch (e) { /* no-op */ }
+              context.createDoc({
+                id: 'router-operation',
+                type: 'router-operation',
+                data: {
+                  operation: 'reconcile',
+                  friday_pr: fridayPr,
+                  pr_events: prEvents,
+                  bb_state: bbState,
+                  config: config,
+                },
+              });
+
+              return {
+                task: 'Reconcile PR ' + fridayPr.pr_id + ' via jira-bugfix-pr-router',
+                config: {
+                  operation: 'reconcile',
+                  friday_pr: fridayPr,
+                  pr_events: prEvents,
+                  bb_state: bbState,
+                  config: config,
+                },
+              };
+            }
+
+        # Consume the router's reconcile output (shape: { events: [...] })
+        # and publish it as the fanout queue. Defensive about data-wrapped
+        # outputs for parity with dispatch_router_decision.
+        record_reconcile_router_output:
+          type: action
+          code: |
+            export default function record_reconcile_router_output(context, event) {
+              var output = context.results['reconcile-router-output'] || {};
+              var payload = Array.isArray(output.events)
+                ? output
+                : (output.data && Array.isArray(output.data.events))
+                  ? output.data
+                  : { events: [] };
+              var events = payload.events || [];
+
+              var state = context.results['reconciler-state'] || {};
+              state.fanout_queue = events;
+              state.fanout_index = 0;
+              context.setResult('reconciler-state', state);
+            }
+
+        fanout_next_or_advance:
+          type: action
+          code: |
+            export default function fanout_next_or_advance(context, event) {
+              var state = context.results['reconciler-state'] || {};
+              var queue = state.fanout_queue || [];
+              var idx = state.fanout_index || 0;
+
+              if (idx >= queue.length) {
+                state.pr_index = (state.pr_index || 0) + 1;
+                context.setResult('reconciler-state', state);
+                context.emit({ type: 'ADVANCE' });
+                return;
+              }
+
+              var payload = queue[idx];
+              context.setResult('current-fanout', { payload: payload });
+              context.emit({ type: 'FANOUT' });
+            }
+
+        fanout_post:
+          type: action
+          code: |
+            export default function fanout_post(context, event) {
+              var current = context.results['current-fanout'] || {};
+              var payload = current.payload || {};
+
+              context.triggerSignal('pr-event', payload);
+
+              var state = context.results['reconciler-state'] || {};
+              state.fanout_index = (state.fanout_index || 0) + 1;
+              state.fanout_stats = state.fanout_stats || { triggered: 0 };
+              state.fanout_stats.triggered = (state.fanout_stats.triggered || 0) + 1;
+              context.setResult('reconciler-state', state);
+            }
+
+      documentTypes:
+        bb-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            repo_slug: { type: string }
+            commit_sha: { type: string }
+            pr_url: { type: string }
+          required:
+            - operation
+
+        bb-result: *bb-result
+
+        # Router input doc for the reconcile operation. Shape mirrors the
+        # router's ReconcileInput dataclass in agent.py.
+        router-operation:
+          type: object
+          properties:
+            operation: { type: string }
+            friday_pr:
+              type: object
+            pr_events:
+              type: array
+              items: { type: object }
+            bb_state:
+              type: object
+            config:
+              type: object
+          required: [operation]
+
+        reconcile-fanouts:
+          type: object
+          properties:
+            events:
+              type: array
+              items: { type: object }
+          required: [events]
+
+      tools: {}
