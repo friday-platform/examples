@@ -40,11 +40,18 @@ signals:
       with @friday or /friday trigger automatic fixes.
     config:
       path: /hook/bitbucket/{workspaceId}/pr-event
+    # Coalesce concurrent CI-status webhooks for the same commit URL so that
+    # a storm of pipeline-status updates only spawns one session per sha.
+    # Resolves against the normalized webhook payload — only ci_status events
+    # carry commit_url, so comment/merged events fall through to the standard
+    # in-flight guard. See
+    # docs/qa/reports/2026-04-19-concurrent-pr-event-race-investigation.md
+    coalesceBy: "{{commit_url}}"
     params:
       ci_status_keys: ["BITBUCKET-PIPELINES"]
       jira_review_status: "Done"
       ttl_hours_friday_prs: 168
-      reconcile_interval_minutes: 10
+      reconcile_interval_minutes: 1440
     schema:
       type: object
       properties:
@@ -90,10 +97,10 @@ signals:
     provider: schedule
     title: Reconcile Friday-owned PRs
     description: >-
-      Cron job that polls for missed events. Fires every 10 minutes as a
+      Cron job that polls for missed events. Fires every day as a
       fallback when webhooks fail.
     config:
-      schedule: '*/10 * * * *'
+      schedule: '0 0 * * *'
       timezone: UTC
 
 agents:
@@ -389,7 +396,7 @@ jobs:
                 type: 'jira-operation',
                 data: {
                   operation: 'issue-search',
-                  jql: 'project = "' + projectKey + '" AND labels = "ai-fix" AND status = "To Do" ORDER BY priority DESC',
+                  jql: 'project = "' + projectKey + '" AND labels = "ai-fix" AND statusCategory = "To Do" ORDER BY priority DESC',
                   max_results: 1,
                 },
               });
@@ -1210,8 +1217,10 @@ jobs:
                 - Keep it under 3 sentences — reviewers do not want novels.
                 - Be professional but not robotic. No greetings, no sign-offs.
 
-                Output a JSON object with a single "body" field containing
-                the reply text.
+                Set `body` to the plain reply text itself — not a JSON object,
+                not a quoted string, not escaped. Just the sentences as prose.
+                The tool call shape is already JSON; do not nest JSON inside
+                it.
               outputTo: pr-reply-message
               outputType: pr-reply-text
             - type: code
@@ -1280,8 +1289,10 @@ jobs:
                 - Keep it factual and brief — this is a status update, not
                   creative writing. No greetings, no sign-offs.
 
-                Output a JSON object with a single "body" field containing
-                the full comment text.
+                Set `body` to the plain reply text itself — not a JSON object,
+                not a quoted string, not escaped. Just the sentences as prose.
+                The tool call shape is already JSON; do not nest JSON inside
+                it.
               outputTo: escalate-message
               outputType: escalation-text
             - type: code
@@ -1356,6 +1367,7 @@ jobs:
                 event_type: eventType,
                 pr_id: prId,
                 sha: resolvedSha,
+                branch: data.refname || data.branch || '',
                 state: data.state || '',
                 key: data.key || '',
                 type: data.type || '',
@@ -1394,17 +1406,19 @@ jobs:
                 return;
               }
 
-              var stateCache = context.results.__stateCache || {};
-              var fridayPrRows = stateCache['friday-prs'] || [];
-              var hintBranch = '';
-              for (var i = 0; i < fridayPrRows.length; i++) {
-                try {
-                  var entry = JSON.parse(fridayPrRows[i].data);
-                  if (entry && entry.repo_slug === repoSlug && entry.branch) {
-                    hintBranch = entry.branch;
-                    break;
-                  }
-                } catch (e) { /* skip */ }
+              var hintBranch = evt.branch || '';
+              if (!hintBranch) {
+                var stateCache = context.results.__stateCache || {};
+                var fridayPrRows = stateCache['friday-prs'] || [];
+                for (var i = 0; i < fridayPrRows.length; i++) {
+                  try {
+                    var entry = JSON.parse(fridayPrRows[i].data);
+                    if (entry && entry.repo_slug === repoSlug && entry.branch) {
+                      hintBranch = entry.branch;
+                      break;
+                    }
+                  } catch (e) { /* skip */ }
+                }
               }
 
               try { context.deleteDoc('bb-operation'); } catch (e) { /* no-op */ }
@@ -1470,14 +1484,26 @@ jobs:
                 return;
               }
 
-              context.stateAppend('friday-prs', {
-                pr_id: String(matched.pr_id),
-                ticket_key: matched.ticket_key || '',
-                sha: sha,
-                branch: matched.branch || '',
-                repo_slug: matched.repo_slug || searchData.repo || '',
-                repo_url: matched.repo_url || '',
-              }, 168);
+              var shaAlreadyTracked = false;
+              for (var k = 0; k < fridayPrRows.length; k++) {
+                try {
+                  var existing = JSON.parse(fridayPrRows[k].data);
+                  if (existing && String(existing.pr_id) === String(matched.pr_id) && existing.sha === sha) {
+                    shaAlreadyTracked = true;
+                    break;
+                  }
+                } catch (e) { /* skip */ }
+              }
+              if (!shaAlreadyTracked && sha) {
+                context.stateAppend('friday-prs', {
+                  pr_id: String(matched.pr_id),
+                  ticket_key: matched.ticket_key || '',
+                  sha: sha,
+                  branch: matched.branch || '',
+                  repo_slug: matched.repo_slug || searchData.repo || '',
+                  repo_url: matched.repo_url || '',
+                }, 168);
+              }
 
               evt.pr_id = String(matched.pr_id);
               if (!evt.repo_slug) evt.repo_slug = matched.repo_slug || searchData.repo || '';
@@ -2553,7 +2579,7 @@ jobs:
   reconcile-prs:
     title: Reconcile Friday-owned PRs
     description: >-
-      Every 10 minutes, walk every row in `friday-prs`, query Bitbucket for
+      Once a day, walk every row in `friday-prs`, query Bitbucket for
       current CI / comment / merge state, and fan out synthetic pr-events for
       anything unresolved that has no matching pr-events breadcrumb.
     triggers:
